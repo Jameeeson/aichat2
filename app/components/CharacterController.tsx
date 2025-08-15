@@ -7,7 +7,7 @@ import styles from "./CharacterController.module.css";
 // Make sure to import the Emotion type as well
 import type { ThreeCanvasHandles, Emotion } from "./ThreeCanvas";
 
-const BACKEND_URL = "http://localhost:9093";
+const BACKEND_URL = "http://3.34.142.34:5001";
 
 // Character and background definitions
 const characters = {
@@ -148,41 +148,49 @@ export default function CharacterController() {
 
   const handleGenerateMotion = async () => {
     if (isGeneratingMotion || !motionPrompt.trim()) return;
+
     setIsGeneratingMotion(true);
-    setStatus("Generating motion...");
+    setStatus("Requesting animation from server...");
+
     try {
-      const bvhResponse = await fetch(`${BACKEND_URL}/generate_bvh`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompts: [motionPrompt] }),
-      });
-      if (!bvhResponse.ok)
-        throw new Error("Failed to generate motion animation");
-      const bvhJson = await bvhResponse.json();
-      const { files_created = [] } = bvhJson;
-      if (files_created.length === 0) {
-        setStatus("No animation files generated.");
-      } else {
-        lastGeneratedFiles.current = files_created;
-        setStatus("Playing generated animation...");
-        for (const fileUrl of files_created) {
-          if (canvasRef.current) {
-            await canvasRef.current.playAnimation(
-              `${BACKEND_URL}/animations/${fileUrl}`
-            );
-          }
+      // 1. Fetch the BVH file names from the backend.
+      const { bvhPlayer } = await import("./BVHAnimationPlayer");
+      const generatedFiles = await bvhPlayer.generateBVHAnimations(BACKEND_URL, [motionPrompt]);
+      
+      if (!generatedFiles || generatedFiles.length === 0) {
+        throw new Error("Backend did not return any BVH files.");
+      }
+
+      lastGeneratedFiles.current = generatedFiles;
+      const bvhUrls = generatedFiles.map(file => `${BACKEND_URL}/generated_bvh/${file}`);
+      
+      setStatus("Playing generated motion...");
+
+      // 2. Get the necessary Three.js objects from the ThreeCanvas component.
+      if (canvasRef.current) {
+        const animationObjects = canvasRef.current.getAnimationObjects();
+        if (animationObjects.mixer && animationObjects.model && animationObjects.idleAction) {
+          // 3. Call the centralized play method in the BVHAnimationPlayer.
+          await bvhPlayer.play({
+              mixer: animationObjects.mixer,
+              model: animationObjects.model,
+              idleAction: animationObjects.idleAction
+          }, bvhUrls);
+          setStatus("Motion completed.");
+        } else {
+          throw new Error("Could not retrieve necessary animation objects from ThreeCanvas.");
         }
-        setStatus("Completed");
       }
     } catch (error) {
       const msg = error instanceof Error ? error.message : "Unknown error";
       setStatus(`Error: ${msg}`);
+      console.error("Error during motion generation:", error);
     } finally {
       setIsGeneratingMotion(false);
     }
   };
 
-  const handleTestLipSync = async () => {
+  const handleTestMotion = async () => {
     if (isTesting) return;
     if (!canvasRef.current) {
       setStatus("Canvas not ready.");
@@ -327,7 +335,7 @@ export default function CharacterController() {
             >
               <h2>Developer Tools</h2>
               <button
-                onClick={handleTestLipSync}
+                onClick={handleTestMotion}
                 disabled={isSubmittingTalk || isGeneratingMotion || isTesting}
                 style={{ width: "100%" }}
               >

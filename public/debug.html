@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>BVH Retargeting Isolation Test</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #333; }
+        canvas { display: block; }
+        #info {
+            position: absolute;
+            top: 10px;
+            width: 100%;
+            text-align: center;
+            color: white;
+            font-family: sans-serif;
+            font-size: 16px;
+        }
+    </style>
+</head>
+<body>
+    <div id="info">Loading assets...</div>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { BVHLoader } from 'three/addons/loaders/BVHLoader.js';
+        import * as SkeletonUtils from 'three/addons/utils/SkeletonUtils.js';
+
+        // --- Core Setup ---
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 1.5, 4);
+        
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.target.set(0, 1, 0);
+
+        const ambientLight = new THREE.AmbientLight(0xffffff, 1.5);
+        scene.add(ambientLight);
+        const dirLight = new THREE.DirectionalLight(0xffffff, 2.0);
+        dirLight.position.set(5, 10, 7.5);
+        scene.add(dirLight);
+
+        const clock = new THREE.Clock();
+        let mixer;
+
+        // --- The Retargeting Options We Want to Test ---
+        const RPM_TPOSE_RETARGET_OPTIONS = {
+            preservePosition: false,
+            useFirstFrameAsBindPose: false,
+            hip: 'Hips',
+            names: {
+                'Hips': 'Hips', 'Spine': 'Spine', 'Spine1': 'Spine1', 'Spine2': 'Spine2', 'Neck': 'Neck', 'Head': 'Head', 'LeftShoulder': 'LeftShoulder', 'LeftArm': 'LeftArm', 'LeftForeArm': 'LeftForeArm', 'LeftHand': 'LeftHand', 'RightShoulder': 'RightShoulder', 'RightArm': 'RightArm', 'RightForeArm': 'RightForeArm', 'RightHand': 'RightHand', 'LeftUpLeg': 'LeftUpLeg', 'LeftLeg': 'LeftLeg', 'LeftFoot': 'LeftFoot', 'LeftToe': 'LeftToeBase', 'RightUpLeg': 'RightUpLeg', 'RightLeg': 'RightLeg', 'RightFoot': 'RightFoot', 'RightToe': 'RightToeBase', 'LeftHandThumb1': 'LeftHand', 'LeftHandThumb2': 'LeftHand', 'LeftHandThumb3': 'LeftHand', 'LeftHandIndex1': 'LeftHand', 'LeftHandIndex2': 'LeftHand', 'LeftHandIndex3': 'LeftHand', 'LeftHandMiddle1': 'LeftHand', 'LeftHandMiddle2': 'LeftHand', 'LeftHandMiddle3': 'LeftHand', 'LeftHandRing1': 'LeftHand', 'LeftHandRing2': 'LeftHand', 'LeftHandRing3': 'LeftHand', 'LeftHandPinky1': 'LeftHand', 'LeftHandPinky2': 'LeftHand', 'LeftHandPinky3': 'LeftHand', 'RightHandThumb1': 'RightHand', 'RightHandThumb2': 'RightHand', 'RightHandThumb3': 'RightHand', 'RightHandIndex1': 'RightHand', 'RightHandIndex2': 'RightHand', 'RightHandIndex3': 'RightHand', 'RightHandMiddle1': 'RightHand', 'RightHandMiddle2': 'RightHand', 'RightHandMiddle3': 'RightHand', 'RightHandRing1': 'RightHand', 'RightHandRing2': 'RightHand', 'RightHandRing3': 'RightHand', 'RightHandPinky1': 'RightHand', 'RightHandPinky2': 'RightHand', 'RightHandPinky3': 'RightHand'
+            }
+        };
+
+        // --- Asset Loading and Retargeting Logic ---
+        async function loadAndAnimate() {
+            const infoEl = document.getElementById('info');
+            try {
+                const gltfLoader = new GLTFLoader();
+                const bvhLoader = new BVHLoader();
+
+                // --- IMPORTANT: Make sure these paths are correct! ---
+                // The GLB must be in your /public folder.
+                // The BVH must be served by your backend from the same domain or have CORS enabled.
+                const MODEL_URL = '/models/Harry.glb';
+                
+                // Use the backend URL for the BVH file
+                const BACKEND_URL = "http://13.125.197.203:5001"; 
+                const BVH_URL = `${BACKEND_URL}/generated_bvh/A_person_runs.bvh`;
+
+                infoEl.innerText = `Loading Model: ${MODEL_URL}`;
+                const gltf = await gltfLoader.loadAsync(MODEL_URL);
+                const model = gltf.scene;
+                scene.add(model);
+                
+                const targetSkinnedMesh = model.getObjectByProperty('isSkinnedMesh', true);
+                if (!targetSkinnedMesh) throw new Error("SkinnedMesh not found in model!");
+
+                infoEl.innerText = `Loading Animation: ${BVH_URL}`;
+                const bvh = await bvhLoader.loadAsync(BVH_URL);
+                
+                // --- THIS IS THE TEST ---
+                
+                // 1. Clean Reset
+                targetSkinnedMesh.skeleton.pose();
+
+                // 2. (OPTIONAL) Manual Root Rotation - UNCOMMENT to test this fix
+                /*
+                console.log("Applying manual 180-degree X-axis rotation...");
+                const rotationQuaternion = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI);
+                bvh.skeleton.bones[0].quaternion.multiply(rotationQuaternion);
+                */
+
+                // 3. Retarget
+                infoEl.innerText = "Retargeting animation...";
+                const clip = SkeletonUtils.retargetClip(
+                    targetSkinnedMesh, 
+                    bvh.skeleton, 
+                    bvh.clip, 
+                    RPM_TPOSE_RETARGET_OPTIONS
+                );
+
+                // 4. Play
+                mixer = new THREE.AnimationMixer(targetSkinnedMesh);
+                const action = mixer.clipAction(clip);
+                action.setEffectiveWeight(1).play();
+
+                infoEl.innerText = "Playing!";
+
+            } catch(error) {
+                console.error("TEST FAILED:", error);
+                infoEl.innerText = `TEST FAILED: ${error.message}`;
+                infoEl.style.color = 'red';
+            }
+        }
+
+        // --- Animation Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+            const delta = clock.getDelta();
+            if (mixer) {
+                mixer.update(delta);
+            }
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        loadAndAnimate();
+        animate();
+
+    </script>
+</body>
+</html>

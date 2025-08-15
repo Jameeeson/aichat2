@@ -23,15 +23,15 @@ const rhubarbToVisemeMap: Record<RhubarbVisemeKey, VisemeMapEntry> = {
   'H': { viseme: 'viseme_O',  jaw: 0.4 }, // Very open for "oh"
 };
 
-const BACKEND_URL = "http://13.124.213.220:5001";
+const BACKEND_URL = "http://3.34.142.34:5001";
 
 const characters = {
   harry: {
     name: 'Harry (The Potter)',
     modelUrl: '/models/Harry.glb',
     introAnimationUrl: "/idleanimations/harryuniqueidle.fbx",
-    idleAnimationUrl: "/idleanimations/StandIdle.fbx",
-    interruptAnimationUrl: "/idleanimations/LookingAround.fbx",
+    idleAnimationUrl: "/idleanimations/Stretching.fbx",
+    interruptAnimationUrl: "/idleanimations/StandIdle.fbx",
     animationUrl: '/idleanimations/LookingAround.fbx',
     talkingAnimationUrl1: '/talkinganimations/Talking2.fbx',
     talkingAnimationUrl2: '/talkinganimations/Talking2.fbx',
@@ -76,6 +76,7 @@ export default function Home() {
   const [chatResponse, setChatResponse] = useState('AI Response will appear here...');
   const [isSending, setIsSending] = useState(false);
   const [isTestingLipSync, setIsTestingLipSync] = useState(false);
+  const [isTestingBVH, setIsTestingBVH] = useState(false);
   const canvasRef = useRef<ThreeCanvasHandles>(null);
 
   const selectedCharacter = characters[selectedCharKey];
@@ -108,36 +109,55 @@ export default function Home() {
       
       // The backend returns the raw Rhubarb cues in the 'visemes' property
       const result = await companionResponse.json();
-      const { response: answer, audio_base64, visemes: rawVisemeCues } = result;
+      const {
+        response: answer,
+        audio_base64,
+        visemes: rawVisemeCues,
+        bvh_files: bvhFileNames,
+        emotion,
+      } = result;
 
-      if (!answer || !audio_base64) {
+      if (!answer) {
         throw new Error("Invalid or incomplete response from companion API");
       }
       
       setChatResponse(answer);
 
-      // Process the visemes before sending them to the canvas
-      if (canvasRef.current && rawVisemeCues && Array.isArray(rawVisemeCues)) {
-        // Translate raw Rhubarb cues to the format our 3D model needs
-        const processedVisemes = rawVisemeCues.map((cue: RawVisemeCue) => {
+      // Prepare optional assets
+      let processedVisemes: Array<{ time: number; value: string; jaw: number }> | null = null;
+      let audioDataUri: string | null = null;
+      if (audio_base64 && rawVisemeCues && Array.isArray(rawVisemeCues)) {
+        processedVisemes = rawVisemeCues.map((cue: RawVisemeCue) => {
           const entry = rhubarbToVisemeMap[cue.value] || rhubarbToVisemeMap['X'];
-          return {
-            time: cue.start,
-            value: entry.viseme, // The morph target name (e.g., 'viseme_aa')
-            jaw: entry.jaw       // The corresponding jaw opening value
-          };
+          return { time: cue.start, value: entry.viseme, jaw: entry.jaw };
         });
-
-        // Add a final silent viseme to ensure the mouth closes after speaking
         if (rawVisemeCues.length > 0) {
           const lastCue = rawVisemeCues[rawVisemeCues.length - 1];
           processedVisemes.push({ time: lastCue.end, value: 'viseme_sil', jaw: 0 });
         }
-        
-        // Play the audio with the correctly translated lip-sync data
-          const audioDataUri = `data:audio/mp3;base64,${audio_base64}`;
-canvasRef.current.playAudioWithEmotionAndLipSync(audioDataUri, processedVisemes, result.emotion || 'neutral');
+        audioDataUri = `data:audio/mp3;base64,${audio_base64}`;
       }
+
+      const bvhUrls = Array.isArray(bvhFileNames) && bvhFileNames.length > 0
+        ? bvhFileNames.map((fileName: string) => `${BACKEND_URL}/generated_bvh/${fileName}`)
+        : [];
+
+      // NEW ORDER: Speak first, then do the motion
+      if (canvasRef.current) {
+        // 1) Speech (if available)
+        if (audioDataUri && processedVisemes) {
+          await canvasRef.current.playAudioWithEmotionAndLipSync(
+            audioDataUri,
+            processedVisemes,
+            emotion || 'neutral'
+          );
+        }
+        // 2) Motion (if available)
+        if (bvhUrls.length > 0) {
+          await canvasRef.current.playAnimation(bvhUrls[0]);
+        }
+      }
+
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : "An unknown error occurred.";
       console.error("Chat submission error:", error);
@@ -202,6 +222,25 @@ canvasRef.current.playAudioWithEmotionAndLipSync(audioDataUri, visemes, 'neutral
           setChatResponse('AI Response will appear here...');
         }
       }, 3000);
+    }
+  };
+
+  const handleTestBVH = async () => {
+    setIsTestingBVH(true);
+    try {
+      if (!canvasRef.current) {
+        setChatResponse('Canvas not ready.');
+        return;
+      }
+      setChatResponse('Loading BVH...');
+      const testBvhUrl = `${BACKEND_URL}/generated_bvh/A_person_runs.bvh`;
+      await canvasRef.current.playAnimation(testBvhUrl);
+      setChatResponse('BVH played.');
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setChatResponse(`BVH test failed: ${msg}`);
+    } finally {
+      setIsTestingBVH(false);
     }
   };
 
@@ -281,6 +320,14 @@ canvasRef.current.playAudioWithEmotionAndLipSync(audioDataUri, visemes, 'neutral
               style={{ width: '100%' }}
             >
               {isTestingLipSync ? 'Testing...' : 'Test Static Lip Sync'}
+            </button>
+            <button
+              onClick={handleTestBVH}
+              disabled={isSending || isTestingBVH}
+              className={styles.button}
+              style={{ width: '100%', marginTop: 8 }}
+            >
+              {isTestingBVH ? 'Loading BVH...' : 'Test BVH (A_person_runs.bvh)'}
             </button>
         </div>
 

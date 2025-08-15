@@ -7,12 +7,16 @@ import React, {
   forwardRef,
 } from "react";
 import * as THREE from "three";
-import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
-import { FBXLoader } from "three/addons/loaders/FBXLoader.js";
-import { RGBELoader } from "three/addons/loaders/RGBELoader.js";
-import { BVHLoader } from "three/addons/loaders/BVHLoader.js";
-import * as SkeletonUtils from "three/addons/utils/SkeletonUtils.js";
+// Replace addon imports with examples/jsm imports for npm usage
+import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+// Removed unused bvhPlayer import to revert
+// import { bvhPlayer } from "./BVHAnimationPlayer";
+import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
+import { FBXLoader } from "three/examples/jsm/loaders/FBXLoader.js";
+import { RGBELoader } from "three/examples/jsm/loaders/RGBELoader.js";
+import { BVHLoader } from "three/examples/jsm/loaders/BVHLoader.js";
+import * as SkeletonUtils from "three/examples/jsm/utils/SkeletonUtils.js";
+import { useState as reactUseState } from "react";
 
 // --- TYPE DEFINITIONS ---
 interface BackgroundData {
@@ -56,6 +60,11 @@ export interface ThreeCanvasHandles {
   ) => Promise<void>;
   playAnimation: (url: string) => Promise<void>;
   setStaticEmotion: (emotion: Emotion) => void;
+  getAnimationObjects: () => {
+    mixer: THREE.AnimationMixer | null;
+    model: THREE.Object3D | null;
+    idleAction: THREE.AnimationAction | null;
+  };
 }
 
 export interface ThreeCanvasProps {
@@ -106,7 +115,8 @@ const boneNameMap: { [key: string]: string } = {
   mixamorigRightHandIndex2: "RightHandIndex2",
   mixamorigRightHandIndex3: "RightHandIndex3",
   mixamorigRightHandMiddle1: "RightHandMiddle1",
-  mixamorigRightHandMiddle2: "LeftHandMiddle2",
+  // Fixed typo: map to RightHandMiddle2 (was LeftHandMiddle2)
+  mixamorigRightHandMiddle2: "RightHandMiddle2",
   mixamorigRightHandMiddle3: "RightHandMiddle3",
   mixamorigRightHandRing1: "RightHandRing1",
   mixamorigRightHandRing2: "RightHandRing2",
@@ -123,7 +133,44 @@ const boneNameMap: { [key: string]: string } = {
   mixamorigRightFoot: "RightFoot",
   mixamorigRightToeBase: "RightToeBase",
 };
+
+// Retarget options to match the debug.html behavior closely
+const RPM_TPOSE_RETARGET_OPTIONS = {
+  preservePosition: false,
+  useFirstFrameAsBindPose: false,
+  hip: "Hips",
+  names: {
+    Hips: "Hips",
+    Spine: "Spine",
+    Spine1: "Spine1",
+    Spine2: "Spine2",
+    Neck: "Neck",
+    Head: "Head",
+    LeftShoulder: "LeftShoulder",
+    LeftArm: "LeftArm",
+    LeftForeArm: "LeftForeArm",
+    LeftHand: "LeftHand",
+    RightShoulder: "RightShoulder",
+    RightArm: "RightArm",
+    RightForeArm: "RightForeArm",
+    RightHand: "RightHand",
+    LeftUpLeg: "LeftUpLeg",
+    LeftLeg: "LeftLeg",
+    LeftFoot: "LeftFoot",
+    LeftToe: "LeftToeBase",
+    RightUpLeg: "RightUpLeg",
+    RightLeg: "RightLeg",
+    RightFoot: "RightFoot",
+    RightToe: "RightToeBase",
+    // IMPORTANT: intentionally omit finger mappings to avoid over-rotating wrists
+    // when BVH contains finger joints. This prevents fist-like poses.
+  },
+};
+
 const bvhRetargetMap = {
+
+  preservePosition: false,
+  useFirstFrameAsBindPose: true,
   hip: "Hips",
   names: {
     Spine: "Spine",
@@ -180,6 +227,10 @@ const bvhRetargetMap = {
   },
 };
 const LERP_SPEED = 10;
+// Fade timings (seconds). Increase FADE_DURATION to make animation crossfades
+// and fade-to-idle longer so transient T-poses are not visible on reset.
+const FADE_DURATION = 1.5;
+const OPACITY_FADE = 0.6;
 
 const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
   (
@@ -235,6 +286,7 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
     const targetJawOpen = useRef(0);
     const targetEmotionWeights = useRef<{ [key: string]: number }>({}).current;
     const mountRef = useRef<HTMLDivElement>(null);
+  const [cameraPosition, setCameraPosition] = useState<{x: number, y: number, z: number}>({x: 0, y: 0, z: 0});
     const animationStateRef = useRef<
       "intro" | "idle" | "interrupt" | "talking"
     >(introAnimationUrl ? "intro" : "idle");
@@ -249,6 +301,30 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
     const audioRef = useRef<THREE.Audio | null>(null);
     const currentSpeechEmotionRef = useRef<Emotion>("neutral");
     const speechEmotionIntensityRef = useRef(0);
+
+    // Camera/model follow & reset helpers
+    const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
+    const controlsRef = useRef<OrbitControls | null>(null);
+    const isFollowingRef = useRef(false);
+    const cameraStartPosRef = useRef(new THREE.Vector3());
+    const controlsStartTargetRef = useRef(new THREE.Vector3());
+    const cameraOffsetRef = useRef(new THREE.Vector3());
+    const controlsOffsetRef = useRef(new THREE.Vector3());
+    const modelRootRef = useRef<THREE.Object3D | null>(null);
+    const modelStartPosRef = useRef(new THREE.Vector3());
+    const modelStartQuatRef = useRef(new THREE.Quaternion());
+    const followAnchorRef = useRef<THREE.Object3D | null>(null); // usually the Hips bone
+    // Store original OrbitControls settings so we can restore after follow
+    const prevControlsStateRef = useRef<{
+      enablePan: boolean;
+      enableRotate: boolean;
+      enableDamping: boolean;
+      dampingFactor: number;
+    } | null>(null);
+  // Desired front-view camera settings during follow (tweak to taste)
+  // Use a small distance and zero side to stay centered and closer to the character.
+  // Lowered height so follow view isn't too high above the character.
+  const followViewRef = useRef({ distance: 3, height: 0, side: 1.2 });
 
     const playAudioWithEmotionAndLipSync = async (
       audioUrl: string,
@@ -317,6 +393,82 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
       return clip;
     };
 
+    // Try to find a pelvis/hips bone on the target model for camera follow
+    const findPelvisBone = (mesh: THREE.SkinnedMesh): THREE.Bone | null => {
+      if (!mesh?.skeleton) return null;
+      const candidates = mesh.skeleton.bones;
+      const preferred = [
+        /^Hips$/i,
+        /mixamorig[:]?Hips/i,
+        /Pelvis/i,
+        /Root$/i,
+        /Spine$/i,
+      ];
+      for (const pattern of preferred) {
+        const bone = candidates.find((b) => pattern.test(b.name));
+        if (bone) return bone;
+      }
+      // Fallback to the shortest-named bone near root
+      const sorted = [...candidates].sort((a, b) => a.name.length - b.name.length);
+      return sorted[0] || null;
+    };
+
+    // Smoothly fade all mesh materials' opacity on an object
+    const fadeObjectOpacity = (
+      obj: THREE.Object3D,
+      targetOpacity: number,
+      duration: number
+    ): Promise<void> => {
+      return new Promise((resolve) => {
+        if (!obj || duration <= 0) {
+          obj?.traverse((child: any) => {
+            if (child.isMesh && child.material) {
+              const mats = Array.isArray(child.material)
+                ? child.material
+                : [child.material];
+              mats.forEach((m: any) => {
+                if (m && typeof m.opacity === "number") {
+                  m.transparent = true;
+                  m.opacity = targetOpacity;
+                  m.needsUpdate = true;
+                }
+              });
+            }
+          });
+          resolve();
+          return;
+        }
+
+        const materials: { mat: any; start: number }[] = [];
+        obj.traverse((child: any) => {
+          if (child.isMesh && child.material) {
+            const mats = Array.isArray(child.material)
+              ? child.material
+              : [child.material];
+            mats.forEach((m: any) => {
+              if (m && typeof m.opacity === "number") {
+                m.transparent = true;
+                materials.push({ mat: m, start: m.opacity ?? 1 });
+              }
+            });
+          }
+        });
+
+        const startTime = performance.now();
+        const tick = () => {
+          const now = performance.now();
+          const t = Math.min(1, (now - startTime) / (duration * 1000));
+          materials.forEach(({ mat, start }) => {
+            mat.opacity = start + (targetOpacity - start) * t;
+            mat.needsUpdate = true;
+          });
+          if (t < 1) requestAnimationFrame(tick);
+          else resolve();
+        };
+        requestAnimationFrame(tick);
+      });
+    };
+
     useImperativeHandle(ref, () => ({
       playAudioWithEmotionAndLipSync: async (
         audioBase64OrUrl,
@@ -358,24 +510,151 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
               if (!bvh.clip) {
                 return reject(new Error("BVH file has no animation data"));
               }
+
+              // Clean reset like debug.html
+              mixer.stopAllAction();
               bodyMesh.skeleton.pose();
+
+              // Optional: strip root translation if needed
+              // const stripped = bvh.clip.clone();
+              // stripped.tracks = stripped.tracks.filter(t => !t.name.endsWith('Hips.position'));
+
               const clip = SkeletonUtils.retargetClip(
                 bodyMesh,
                 bvh.skeleton,
                 bvh.clip,
-                bvhRetargetMap
+                RPM_TPOSE_RETARGET_OPTIONS
               );
+
+              // Dedupe wrist quaternion tracks to avoid over-rotation
+              const seenQuat = new Set<string>();
+              const deduped: THREE.KeyframeTrack[] = [];
+              for (const track of clip.tracks) {
+                if (
+                  track.name.endsWith(".quaternion") &&
+                  (track.name.startsWith("LeftHand.") ||
+                    track.name.startsWith("RightHand."))
+                ) {
+                  if (seenQuat.has(track.name)) {
+                    continue; // drop duplicates
+                  }
+                  seenQuat.add(track.name);
+                }
+                deduped.push(track);
+              }
+              clip.tracks = deduped;
+
               const action = mixer.clipAction(clip);
               action.setLoop(THREE.LoopOnce, 1);
               action.clampWhenFinished = true;
-              idleAction.fadeOut(0.3);
-              action.reset().fadeIn(0.3).play();
+
+              // Setup camera follow offsets relative to the model root
+              const camera = cameraRef.current;
+              const controls = controlsRef.current;
+              // Prefer following the pelvis/hips bone if available
+              const hipsBone = findPelvisBone(bodyMesh) as unknown as THREE.Object3D | null;
+              followAnchorRef.current = hipsBone || (bodyMesh as unknown as THREE.Object3D);
+              const anchor = followAnchorRef.current;
+              if (camera && controls && anchor) {
+                anchor.updateMatrixWorld?.(true);
+                const anchorPos = new THREE.Vector3();
+                anchor.getWorldPosition(anchorPos);
+                cameraStartPosRef.current.copy(camera.position);
+                controlsStartTargetRef.current.copy(controls.target);
+                // Front-of-character offset: in front (opposite forward), a bit above hips
+                const q = new THREE.Quaternion();
+                anchor.getWorldQuaternion(q);
+                const right = new THREE.Vector3(1, 0, 0).applyQuaternion(q);
+                const up = new THREE.Vector3(0, 1, 0).applyQuaternion(q);
+                const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(q);
+                const { distance, height, side } = followViewRef.current;
+                cameraOffsetRef.current
+                  .copy(right).multiplyScalar(side)
+                  .addScaledVector(up, height)
+                  .addScaledVector(forward, -distance);
+                // Debug log so we can verify the follow anchor and offset
+                console.log("follow enabled: anchor=", anchor.name || '(root)', "anchorPos=", anchorPos.toArray(), "offset=", cameraOffsetRef.current.toArray());
+                // Force the controls target to be exactly the anchor (center the character)
+                controlsOffsetRef.current.set(0, 0, 0);
+
+                // Disable user interactions that can push the target off-center during follow
+                prevControlsStateRef.current = {
+                  enablePan: controls.enablePan,
+                  enableRotate: controls.enableRotate,
+                  enableDamping: controls.enableDamping,
+                  dampingFactor: controls.dampingFactor,
+                };
+                controls.enablePan = false;
+                controls.enableRotate = false; // ensure perfect centering
+                controls.enableDamping = false; // avoid damping-induced drift
+                controls.update();
+
+                isFollowingRef.current = true;
+              }
+
+              idleAction.fadeOut(FADE_DURATION);
+              action.reset().fadeIn(FADE_DURATION).play();
+
               const onFinished = (e: any) => {
                 if (e.action === action) {
                   mixer.removeEventListener("finished", onFinished);
-                  action.fadeOut(0.3);
-                  idleAction.reset().fadeIn(0.3).play();
-                  resolve();
+
+                  // Async finish flow: fade out, reset pose and camera, fade in idle
+                  (async () => {
+                    try {
+                      isFollowingRef.current = false;
+                      const modelRootFinish = modelRootRef.current || bodyMesh.parent;
+                      if (modelRootFinish) {
+                        await fadeObjectOpacity(modelRootFinish, 0, OPACITY_FADE);
+                      }
+
+                      // Reset camera back to start
+                      const cam = cameraRef.current;
+                      const ctrls = controlsRef.current;
+                      if (cam && ctrls) {
+                        cam.position.copy(cameraStartPosRef.current);
+                        ctrls.target.copy(controlsStartTargetRef.current);
+                        // Restore controls settings
+                        const prev = prevControlsStateRef.current;
+                        if (prev) {
+                          ctrls.enablePan = prev.enablePan;
+                          ctrls.enableRotate = prev.enableRotate;
+                          ctrls.enableDamping = prev.enableDamping;
+                          ctrls.dampingFactor = prev.dampingFactor;
+                        } else {
+                          // Reasonable defaults if prev state missing
+                          ctrls.enablePan = true;
+                          ctrls.enableRotate = true;
+                          ctrls.enableDamping = true;
+                          ctrls.dampingFactor = 0.08;
+                        }
+                        ctrls.update();
+                      }
+
+                      // Reset skeleton/model and return to idle
+                      mixer.stopAllAction();
+                      action.stop();
+                      bodyMesh.skeleton.pose();
+                      const modelRootReset = modelRootRef.current || bodyMesh.parent;
+                      if (modelRootReset) {
+                        modelRootReset.position.copy(modelStartPosRef.current);
+                        modelRootReset.quaternion.copy(modelStartQuatRef.current);
+                        (modelRootReset as any).updateMatrixWorld?.(true);
+                      }
+
+                        idleAction.reset().setEffectiveWeight(1).fadeIn(FADE_DURATION).play();
+
+                      if (modelRootFinish) {
+                        await fadeObjectOpacity(modelRootFinish, 1, OPACITY_FADE);
+                      }
+                    } catch (err) {
+                      console.error(err);
+                      // Fallback to simple fade to idle
+                      idleAction.reset().setEffectiveWeight(1).fadeIn(1).play();
+                    } finally {
+                      resolve();
+                    }
+                  })();
                 }
               };
               mixer.addEventListener("finished", onFinished);
@@ -390,7 +669,116 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
       setStaticEmotion: (emotion) => {
         currentSpeechEmotionRef.current = emotion;
       },
+      getAnimationObjects: () => {
+        return {
+          mixer: mixerRef.current,
+          model: bodyMeshRef.current ? bodyMeshRef.current.parent : null,
+          idleAction: idleActionRef.current,
+        };
+      },
     }));
+
+    // Handle assets after Promise.all resolves. Pulled out as a helper to keep
+    // the main effect body short and easier to read.
+    const handleAssetsLoaded = (
+      assets: any[],
+      scene: THREE.Scene,
+      camera: THREE.PerspectiveCamera,
+      controls: OrbitControls,
+      renderer: THREE.WebGLRenderer
+    ) => {
+      let assetIndex = 0;
+      const gltf = assets[assetIndex++] as any;
+      const idleFbx = assets[assetIndex++] as any;
+      const introFbx = introAnimationUrl ? (assets[assetIndex++] as any) : null;
+      const interruptFbx = interruptAnimationUrl ? (assets[assetIndex++] as any) : null;
+      const talkingFbx1 = talkingAnimationUrl1 ? (assets[assetIndex++] as any) : null;
+      const talkingFbx2 = talkingAnimationUrl2 ? (assets[assetIndex++] as any) : null;
+      const characterModel = gltf.scene;
+      scene.add(characterModel);
+      bodyMeshRef.current = characterModel.getObjectByProperty(
+        "isSkinnedMesh",
+        true
+      ) as THREE.SkinnedMesh;
+
+      // Store model root and its starting transform for reset
+      modelRootRef.current = characterModel;
+      modelStartPosRef.current.copy(characterModel.position);
+      modelStartQuatRef.current.copy(characterModel.quaternion);
+
+      // Log bone list for debugging
+      const modelBones = bodyMeshRef.current.skeleton.bones.map((bone) => bone.name);
+      console.log("--- CHARACTER MODEL BONES (TARGET) ---", modelBones);
+
+      // Initialize mixer using the skinned mesh
+      mixerRef.current = new THREE.AnimationMixer(bodyMeshRef.current);
+      characterModel.traverse((object: any) => {
+        if (object.isMesh) object.castShadow = true;
+        if (object.isSkinnedMesh && object.morphTargetDictionary) {
+          if (
+            object.name === "Wolf3D_Head" ||
+            object.name === "Wolf3D_Avatar" ||
+            object.name === "head"
+          ) {
+            faceMeshRef.current = object;
+          }
+        }
+      });
+
+      const idleAction = mixerRef.current.clipAction(
+        retargetClip(idleFbx.animations[0])
+      );
+      idleAction.setLoop(THREE.LoopRepeat, Infinity);
+      idleAction.play();
+      idleActionRef.current = idleAction;
+
+      let introAction: THREE.AnimationAction | null = null;
+      let interruptAction: THREE.AnimationAction | null = null;
+      let talkingAction1: THREE.AnimationAction | null = null;
+      let talkingAction2: THREE.AnimationAction | null = null;
+
+      if (introFbx) {
+        introAction = mixerRef.current.clipAction(
+          retargetClip(introFbx.animations[0])
+        );
+        introAction.setLoop(THREE.LoopOnce, 1);
+        introAction.clampWhenFinished = true;
+        idleAction.weight = 0;
+        introAction.play();
+      }
+      if (interruptFbx) {
+        interruptAction = mixerRef.current.clipAction(
+          retargetClip(interruptFbx.animations[0])
+        );
+        interruptAction.setLoop(THREE.LoopOnce, 1);
+        interruptAction.clampWhenFinished = true;
+      }
+      if (talkingFbx1) {
+        talkingAction1 = mixerRef.current.clipAction(
+          retargetClip(talkingFbx1.animations[0])
+        );
+        talkingAction1.setLoop(THREE.LoopRepeat, Infinity);
+      }
+      if (talkingFbx2) {
+        talkingAction2 = mixerRef.current.clipAction(
+          retargetClip(talkingFbx2.animations[0])
+        );
+        talkingAction2.setLoop(THREE.LoopRepeat, Infinity);
+      }
+
+      mixerRef.current.addEventListener("finished", (e: any) => {
+        const idle = idleActionRef.current;
+        if (!idle) return;
+        if (e.action === introAction || e.action === interruptAction) {
+          animationStateRef.current = "idle";
+          e.action.fadeOut(0.5);
+          idle.reset().setEffectiveWeight(1).fadeIn(0.5).play();
+          if (e.action === interruptAction) {
+            /* outer scope manages scheduling next interrupt */
+          }
+        }
+      });
+    };
 
     useEffect(() => {
       if (!mountRef.current) return;
@@ -469,7 +857,9 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
         0.1,
         1000
       );
-      camera.position.set(0, 1.5, 4);
+  // Lowered initial camera Y and moved closer (smaller Z) so follow preserves a lower view.
+  camera.position.set(-0.13, 1.0, 2.61);
+  setCameraPosition({x: camera.position.x, y: camera.position.y, z: camera.position.z});
       const audioListener = new THREE.AudioListener();
       camera.add(audioListener);
       audioRef.current = new THREE.Audio(audioListener);
@@ -484,9 +874,17 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
       dirLight.position.set(3, 10, 10);
       dirLight.castShadow = true;
       scene.add(dirLight);
-      const controls = new OrbitControls(camera, renderer.domElement);
-      controls.target.set(0, 1, 0);
+  const controls = new OrbitControls(camera, renderer.domElement);
+  // Align control target Y with camera Y so initial view height matches camera position
+  controls.target.set(0, camera.position.y, 0);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.08;
       controls.update();
+
+      // Save camera/controls refs
+      cameraRef.current = camera;
+      controlsRef.current = controls;
+
       const clock = new THREE.Clock();
       const gltfLoader = new GLTFLoader();
       const fbxLoader = new FBXLoader();
@@ -542,7 +940,20 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
             "isSkinnedMesh",
             true
           ) as THREE.SkinnedMesh;
-          mixerRef.current = new THREE.AnimationMixer(characterModel);
+
+          // Store model root and its starting transform for reset
+          modelRootRef.current = characterModel;
+          modelStartPosRef.current.copy(characterModel.position);
+          modelStartQuatRef.current.copy(characterModel.quaternion);
+
+          // --- ADD THIS LOG ---
+          // This will print an array of all bone names in your character model.
+          const modelBones = bodyMeshRef.current.skeleton.bones.map(bone => bone.name);
+          console.log("--- CHARACTER MODEL BONES (TARGET) ---", modelBones);
+          // --- END OF ADDED LOG ---
+
+          // 3. Initialize the mixer with the CORRECT object (the SkinnedMesh)
+          mixerRef.current = new THREE.AnimationMixer(bodyMeshRef.current);
           characterModel.traverse((object: any) => {
             if (object.isMesh) object.castShadow = true;
             if (object.isSkinnedMesh && object.morphTargetDictionary) {
@@ -605,11 +1016,53 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
 
       let animationFrameId: number;
       const animate = () => {
+        if (cameraRef.current) {
+          const pos = cameraRef.current.position;
+          setCameraPosition({x: Number(pos.x.toFixed(2)), y: Number(pos.y.toFixed(2)), z: Number(pos.z.toFixed(2))});
+        }
+        // ...existing animation code...
         animationFrameId = requestAnimationFrame(animate);
         const delta = clock.getDelta();
         const elapsedTime = clock.getElapsedTime();
         if (mixerRef.current) mixerRef.current.update(delta);
         controls.update();
+
+        // Camera follow while BVH is playing
+        if (
+          isFollowingRef.current &&
+          followAnchorRef.current &&
+          cameraRef.current &&
+          controlsRef.current
+        ) {
+          followAnchorRef.current.updateMatrixWorld?.(true);
+          const anchorPos = new THREE.Vector3();
+          followAnchorRef.current.getWorldPosition(anchorPos);
+
+          // Compute orientation vectors
+          const q = new THREE.Quaternion();
+          followAnchorRef.current.getWorldQuaternion(q);
+          const right = new THREE.Vector3(1, 0, 0).applyQuaternion(q);
+          const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(q);
+          const { distance, height, side } = followViewRef.current;
+
+          // Horizontal-only offset (zero Y) so camera doesn't follow vertical motion
+          const horizontalOffset = new THREE.Vector3()
+            .addScaledVector(right, side)
+            .addScaledVector(forward, -distance);
+          horizontalOffset.y = 0;
+
+          // Preserve camera Y (do not move vertically)
+          const camY = cameraRef.current.position.y;
+
+          // New camera position: anchor X/Z + horizontal offset, keep original camera Y
+          const targetPos = new THREE.Vector3(anchorPos.x, camY, anchorPos.z).add(horizontalOffset);
+          cameraRef.current.position.copy(targetPos);
+
+          // Update controls target X/Z to follow anchor, but keep target Y unchanged to avoid tilting
+          const currentTarget = controlsRef.current.target;
+          controlsRef.current.target.set(anchorPos.x, currentTarget.y, anchorPos.z);
+          controlsRef.current.update();
+        }
 
         const faceMesh = faceMeshRef.current;
         const idle = idleActionRef.current;
@@ -843,9 +1296,33 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
       backgroundPreset,
     ]);
 
-    return <div ref={mountRef} style={{ width: "100%", height: "100%" }} />;
+    return (
+      <div style={{ width: "100%", height: "100%", position: "relative" }}>
+        <div
+          style={{
+            position: "absolute",
+            top: 12,
+            right: 18,
+            background: "rgba(30,30,30,0.7)",
+            color: "#fff",
+            padding: "6px 12px",
+            borderRadius: "8px",
+            fontSize: "13px",
+            zIndex: 10,
+            pointerEvents: "none",
+          }}
+        >
+          Camera: x={cameraPosition.x}, y={cameraPosition.y}, z={cameraPosition.z}
+        </div>
+        <div ref={mountRef} style={{ width: "100%", height: "100%" }} />
+      </div>
+    );
   }
 );
 
 ThreeCanvas.displayName = "ThreeCanvas";
 export default ThreeCanvas;
+function useState<T>(initialValue: T): [T, React.Dispatch<React.SetStateAction<T>>] {
+  return reactUseState(initialValue);
+}
+

@@ -227,7 +227,7 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(({
     scene.add(ground);
 
     const camera = new THREE.PerspectiveCamera(45, currentMount.clientWidth / currentMount.clientHeight, 0.1, 1000);
-    camera.position.set(0, 1.5, 4);
+    camera.position.set(-0.13, 1.57, 2.61);
     
     const audioListener = new THREE.AudioListener();
     camera.add(audioListener);

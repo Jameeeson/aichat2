@@ -102,3 +102,67 @@
   outline: 2px solid #3b82f6;
   outline-offset: 2px;
 }
+
+/* --- Visibility helpers --- */
+.mobileOnly { display: none; }
+.desktopOnly { display: block; }
+
+/* --- Fixed mobile input bar like ChatGPT/Grok --- */
+.mobileChatBar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: #1f2937; /* panel bg */
+  border-top: 1px solid #374151;
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  z-index: 50;
+}
+
+.mobileInput {
+  flex: 1;
+  padding: 12px;
+  background-color: #374151;
+  border-radius: 8px;
+  border: none;
+  color: #fff;
+}
+
+.mobileSendBtn {
+  padding: 10px 14px;
+  border-radius: 8px;
+  background-color: #2563eb; /* blue-600 */
+  color: #fff;
+  border: none;
+  cursor: pointer;
+  font-size: 0.95rem;
+}
+
+.mobileSendBtn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* Add bottom padding to content so it isn't hidden behind fixed bar */
+.withBottomBar { padding-bottom: 76px; }
+
+/* --- Responsive layout adjustments --- */
+@media (max-width: 768px) {
+  .mainContainer { flex-direction: column; }
+  .leftPanel {
+    width: 100%;
+    min-width: 0;
+    order: 2;
+    padding: 16px;
+    padding-bottom: 90px; /* extra space above fixed bar */
+  }
+  .rightPanel {
+    width: 100%;
+    height: 100%;
+  }
+  .mobileOnly { display: block; }
+  .desktopOnly { display: none; }
+}
