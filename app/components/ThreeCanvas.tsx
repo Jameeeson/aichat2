@@ -783,11 +783,12 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
     useEffect(() => {
       if (!mountRef.current) return;
       const currentMount = mountRef.current;
-      const scene = new THREE.Scene();
+  const scene = new THREE.Scene();
       const selectedBackground: BackgroundData =
         backgroundData || backgrounds[backgroundPreset] || backgrounds.studio;
-      const textureLoader = new THREE.TextureLoader();
-      let ground: THREE.Mesh;
+  const textureLoader = new THREE.TextureLoader();
+  // Create ground only for non-studio backgrounds
+  let ground: THREE.Mesh | null = null;
       switch (selectedBackground.name) {
         case "Forest":
           textureLoader.load("/textures/forest/forestbg.jpg", (texture) => {
@@ -838,19 +839,23 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
           );
           break;
         case "Studio":
+          // Keep the WebGL canvas fully transparent so the page CSS gradient shows through.
+          // No ground plane for studio to match the reference design.
+          ground = null;
+          break;
         default:
-          scene.background = new THREE.Color(
-            selectedBackground.color || 0xa0a0a0
-          );
+          scene.background = new THREE.Color(selectedBackground.color || 0xa0a0a0);
           ground = new THREE.Mesh(
             new THREE.PlaneGeometry(100, 100),
             new THREE.MeshPhongMaterial({ color: 0xbbbbbb, depthWrite: false })
           );
           break;
       }
-      ground.rotation.x = -Math.PI / 2;
-      ground.receiveShadow = true;
-      scene.add(ground);
+      if (ground) {
+        ground.rotation.x = -Math.PI / 2;
+        ground.receiveShadow = true;
+        scene.add(ground);
+      }
       const camera = new THREE.PerspectiveCamera(
         45,
         currentMount.clientWidth / currentMount.clientHeight,
@@ -863,10 +868,12 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
       const audioListener = new THREE.AudioListener();
       camera.add(audioListener);
       audioRef.current = new THREE.Audio(audioListener);
-      const renderer = new THREE.WebGLRenderer({ antialias: true });
+  // alpha:true + transparent clear color prevents any white flash and lets CSS background show
+  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
       renderer.setSize(currentMount.clientWidth, currentMount.clientHeight);
       renderer.setPixelRatio(window.devicePixelRatio);
       renderer.shadowMap.enabled = true;
+  renderer.setClearColor(0x000000, 0); // fully transparent
       currentMount.appendChild(renderer.domElement);
       const hemiLight = new THREE.HemisphereLight(0xffffff, 0x444444, 3);
       scene.add(hemiLight);

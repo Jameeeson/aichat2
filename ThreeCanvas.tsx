@@ -218,7 +218,32 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(({
 
       case 'Studio':
       default:
-        scene.background = new THREE.Color(selectedBackground.color || 0xa0a0a0);
+        // Create a vertical blue gradient as a CanvasTexture so the background feels like the app reference
+        const bgCanvas = document.createElement('canvas');
+        bgCanvas.width = 1024;
+        bgCanvas.height = 1024;
+        const bgCtx = bgCanvas.getContext('2d');
+        if (bgCtx) {
+          const grad = bgCtx.createLinearGradient(0, 0, 0, bgCanvas.height);
+          grad.addColorStop(0, '#0b3358');
+          grad.addColorStop(1, '#062842');
+          bgCtx.fillStyle = grad;
+          bgCtx.fillRect(0, 0, bgCanvas.width, bgCanvas.height);
+          // optional subtle star/noise
+          bgCtx.globalAlpha = 0.02;
+          for (let i = 0; i < 400; i++) {
+            const x = Math.random() * bgCanvas.width;
+            const y = Math.random() * bgCanvas.height;
+            const s = Math.random() * 1.5;
+            bgCtx.fillRect(x, y, s, s);
+          }
+        }
+        const gradTexture = new THREE.CanvasTexture(bgCanvas);
+        gradTexture.mapping = THREE.EquirectangularReflectionMapping;
+        scene.background = gradTexture;
+
+  // No Three.js overlay – CSS wave.png is used behind the transparent canvas.
+
         ground = new THREE.Mesh(new THREE.PlaneGeometry(100, 100), new THREE.MeshPhongMaterial({ color: 0xbbbbbb, depthWrite: false }));
         break;
     }
@@ -233,11 +258,16 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(({
     camera.add(audioListener);
     audioListenerRef.current = audioListener;
 
-    const renderer = new THREE.WebGLRenderer({ antialias: true });
-    renderer.setSize(currentMount.clientWidth, currentMount.clientHeight);
-    renderer.setPixelRatio(window.devicePixelRatio);
-    renderer.shadowMap.enabled = true;
-    currentMount.appendChild(renderer.domElement);
+  // Use a transparent canvas so the underlying page background (CSS) is visible
+  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setSize(currentMount.clientWidth, currentMount.clientHeight);
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.shadowMap.enabled = true;
+  // ensure the clear color is fully transparent initially to avoid a flash of white
+  renderer.setClearColor(new THREE.Color(0x000000), 0);
+  // make sure the DOM element doesn't have an opaque background
+  renderer.domElement.style.background = 'transparent';
+  currentMount.appendChild(renderer.domElement);
     
     const hemiLight = new THREE.HemisphereLight(0xffffff, 0x444444, 3);
     scene.add(hemiLight);

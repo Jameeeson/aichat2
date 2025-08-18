@@ -1,9 +1,8 @@
 'use client';
 
 import { useState, useRef } from 'react';
-import ThreeCanvas from '../app/components/ThreeCanvas';
 import styles from './page.module.css';
-import type { ThreeCanvasHandles } from '../app/components/ThreeCanvas';
+import ThreeCanvas, { type ThreeCanvasHandles } from './components/ThreeCanvas';
 
 // This map translates Rhubarb's output to your specific model's viseme names.
 export type RhubarbVisemeKey = 'X' | 'A' | 'B' | 'C' | 'D' | 'E' | 'F' | 'G' | 'H';
@@ -23,7 +22,7 @@ const rhubarbToVisemeMap: Record<RhubarbVisemeKey, VisemeMapEntry> = {
   'H': { viseme: 'viseme_O',  jaw: 0.4 }, // Very open for "oh"
 };
 
-const BACKEND_URL = "http://3.34.142.34:5001";
+const BACKEND_URL = "http://43.203.230.137:5001";
 
 const characters = {
   harry: {
@@ -70,10 +69,12 @@ type RawVisemeCue = { start: number; end: number; value: RhubarbVisemeKey };
 
 
 export default function Home() {
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [selectedCharKey, setSelectedCharKey] = useState<CharacterKey>('harry');
   const [selectedBgKey, setSelectedBgKey] = useState<BackgroundKey>('studio');
   const [chatInput, setChatInput] = useState('');
-  const [chatResponse, setChatResponse] = useState('AI Response will appear here...');
+  const [chatResponse, setChatResponse] = useState('');
+  const [messages, setMessages] = useState<Array<{role: 'user' | 'assistant'; text: string}>>([]);
   const [isSending, setIsSending] = useState(false);
   const [isTestingLipSync, setIsTestingLipSync] = useState(false);
   const [isTestingBVH, setIsTestingBVH] = useState(false);
@@ -87,10 +88,12 @@ export default function Home() {
     e.preventDefault();
     if (isSending || !chatInput.trim()) return;
 
-    setIsSending(true);
-    setChatResponse('Thinking...');
-    const prompt = chatInput;
-    setChatInput('');
+  setIsSending(true);
+  const userText = chatInput;
+  // append user message to history immediately
+  setMessages(prev => [...prev, { role: 'user', text: userText }]);
+  const prompt = chatInput;
+  setChatInput('');
 
     try {
       const companionResponse = await fetch(`${BACKEND_URL}/api/companion`, {
@@ -121,7 +124,8 @@ export default function Home() {
         throw new Error("Invalid or incomplete response from companion API");
       }
       
-      setChatResponse(answer);
+  // append assistant message to history
+  setMessages(prev => [...prev, { role: 'assistant', text: answer }]);
 
       // Prepare optional assets
       let processedVisemes: Array<{ time: number; value: string; jaw: number }> | null = null;
@@ -161,7 +165,7 @@ export default function Home() {
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : "An unknown error occurred.";
       console.error("Chat submission error:", error);
-      setChatResponse(`Error: ${errorMessage}`);
+  setMessages(prev => [...prev, { role: 'assistant', text: `Error: ${errorMessage}` }]);
     } finally {
       setIsSending(false);
     }
@@ -177,7 +181,7 @@ export default function Home() {
     if (isSending) return; 
 
     setIsSending(true); 
-    setChatResponse('Running static lip-sync test...');
+  // no placeholder in the bar; optional: push a system message if needed
 
     try {
       const response = await fetch('/audio/test-speech.json');
@@ -207,21 +211,17 @@ export default function Home() {
 canvasRef.current.playAudioWithEmotionAndLipSync(audioDataUri, visemes, 'neutral');
 
 
-      setChatResponse('Static lip-sync test complete.');
+  setMessages(prev => [...prev, { role: 'assistant', text: 'Static lip-sync test complete.' }]);
 
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : "An unknown error occurred.";
       console.error("Lip-sync test failed:", error);
-      setChatResponse(`Error in test: ${errorMessage}`);
+  setMessages(prev => [...prev, { role: 'assistant', text: `Error in test: ${errorMessage}` }]);
     } finally {
       setIsSending(false);
       setIsTestingLipSync(false);
       
-      setTimeout(() => {
-        if (chatResponse.startsWith('Static lip-sync')) {
-          setChatResponse('AI Response will appear here...');
-        }
-      }, 3000);
+  // keep history; no placeholder reset
     }
   };
 
@@ -232,108 +232,59 @@ canvasRef.current.playAudioWithEmotionAndLipSync(audioDataUri, visemes, 'neutral
         setChatResponse('Canvas not ready.');
         return;
       }
-      setChatResponse('Loading BVH...');
+  setMessages(prev => [...prev, { role: 'assistant', text: 'Loading BVH...' }]);
       const testBvhUrl = `${BACKEND_URL}/generated_bvh/A_person_runs.bvh`;
       await canvasRef.current.playAnimation(testBvhUrl);
-      setChatResponse('BVH played.');
+  setMessages(prev => [...prev, { role: 'assistant', text: 'BVH played.' }]);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      setChatResponse(`BVH test failed: ${msg}`);
+  setMessages(prev => [...prev, { role: 'assistant', text: `BVH test failed: ${msg}` }]);
     } finally {
       setIsTestingBVH(false);
     }
   };
 
   return (
-    <main className={styles.mainContainer}>
-      <div className={styles.leftPanel}>
-        <div className={styles.section}>
-          <h1>AI Companion</h1>
-          <p>Choose your companion and setting. Then, start a conversation.</p>
-        </div>
-        
-        <div className={styles.chatSection} style={{ marginBottom: 16 }}>
-          <h2 style={{ marginBottom: 8 }}>Chat</h2>
-          <form onSubmit={handleChatSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-            <div className={styles.chatBox} style={{ minHeight: 32, marginBottom: 6, fontSize: 14, padding: 8 }}>
-              {chatResponse}
-            </div>
-            <div style={{ display: 'flex', gap: 6 }}>
-              <input
-                type="text"
-                placeholder="Type your message..."
-                className={styles.chatInput}
-                value={chatInput}
-                onChange={e => setChatInput(e.target.value)}
-                style={{ flex: 1, fontSize: 14, padding: 6 }}
-                disabled={isSending}
-              />
-              <button
-                type="submit"
-                className={styles.button}
-                style={{ padding: '6px 14px', fontSize: 14 }}
-                disabled={isSending || !chatInput.trim()}
-              >
-                {isSending && !isTestingLipSync ? '...' : 'Send'}
-              </button>
-            </div>
-          </form>
-        </div>
+    <main suppressHydrationWarning className={`${styles.mainContainer} ${!isSidebarOpen ? styles.sidebarCollapsed : ''}`}>
+  <div className={styles.leftPanel}>
+        <div className={styles.sidebarCard}>
+          <div className={styles.sidebarHeader}>
+    <button className={styles.hamburger} aria-label="Close menu" onClick={() => setIsSidebarOpen(false)}>☰</button>
+            <div className={styles.title}>Chats</div>
+          </div>
 
-        <div className={styles.section}>
-          <h2>Choose a Character</h2>
-          <div className={styles.buttonGroup}>
+          <div className={styles.searchWrap}>
+            <input className={styles.searchInput} placeholder="Search" suppressHydrationWarning autoComplete="off" />
+          </div>
+
+          <div className={styles.personaList}>
             {(Object.keys(characters) as CharacterKey[]).map((key) => (
-              <button
+              <div
                 key={key}
+                className={`${styles.personaItem} ${selectedCharKey === key ? styles.personaActive : ''}`}
                 onClick={() => setSelectedCharKey(key)}
-                className={`${styles.button} ${selectedCharKey === key ? styles.activeButton : ''}`}
-                disabled={isSending}
               >
-                {characters[key].name}
-              </button>
+                <div className={styles.personaAvatar} />
+                <div className={styles.personaName}>{characters[key].name.split(' ')[0]}</div>
+              </div>
             ))}
           </div>
-        </div>
-        <div className={styles.section}>
-          <h2>Choose a Background</h2>
-          <div className={styles.buttonGroup}>
-            {(Object.keys(backgrounds) as BackgroundKey[]).map((key) => (
-              <button
-                key={key}
-                onClick={() => setSelectedBgKey(key)}
-                className={`${styles.button} ${selectedBgKey === key ? styles.activeButton : ''}`}
-                disabled={isSending}
-              >
-                {backgrounds[key].name}
-              </button>
-            ))}
+
+          <div className={styles.sidebarTools}>
+            <div className={styles.toolsDivider} />
+            <div className={styles.toolItem} onClick={() => alert('Profile')}>
+              <span className={styles.toolIcon}>👤</span>
+              <span>Profile</span>
+            </div>
+            <div className={styles.toolItem} onClick={() => alert('Settings')}>
+              <span className={styles.toolIcon}>⚙️</span>
+              <span>Settings</span>
+            </div>
           </div>
         </div>
-
-        <div className={styles.section} style={{ marginTop: '20px', borderTop: '1px solid #444', paddingTop: '15px' }}>
-            <h3 style={{ marginBottom: 8 }}>Dev Tools</h3>
-            <button 
-              onClick={handleTestLipSync} 
-              disabled={isSending}
-              className={styles.button}
-              style={{ width: '100%' }}
-            >
-              {isTestingLipSync ? 'Testing...' : 'Test Static Lip Sync'}
-            </button>
-            <button
-              onClick={handleTestBVH}
-              disabled={isSending || isTestingBVH}
-              className={styles.button}
-              style={{ width: '100%', marginTop: 8 }}
-            >
-              {isTestingBVH ? 'Loading BVH...' : 'Test BVH (A_person_runs.bvh)'}
-            </button>
-        </div>
-
       </div>
       
-      <div className={styles.rightPanel}>
+  <div className={styles.rightPanel}>
         <ThreeCanvas
           ref={canvasRef}
           characterModelUrl={selectedCharacter.modelUrl}
@@ -345,6 +296,50 @@ canvasRef.current.playAudioWithEmotionAndLipSync(audioDataUri, visemes, 'neutral
 
           backgroundData={selectedBackground}
         />
+        {/* AI response bubble above the input, centered */}
+        {messages.length > 0 && (
+          <div className={styles.messageCard}>
+            <div className={styles.messageContent}>
+              {messages.slice(-4).map((m, idx) => (
+                <div key={idx} style={{opacity: m.role === 'assistant' ? 1 : 0.95}}>
+                  <strong>{m.role === 'assistant' ? selectedCharacter.name.split(' ')[0] : 'User'} :</strong>&nbsp;{m.text.replace(/\n\[none\]$/i, '').trim()}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+        {/* Canvas overlays: floating hamburger (visible only when sidebar is closed) */}
+  {!isSidebarOpen && (
+          <div className={styles.canvasHamburger} onClick={() => setIsSidebarOpen(true)}>
+            <svg width="20" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <rect x="3" y="5" width="18" height="2" rx="1" fill="white" />
+              <rect x="3" y="11" width="18" height="2" rx="1" fill="white" opacity="0.9" />
+              <rect x="3" y="17" width="18" height="2" rx="1" fill="white" opacity="0.8" />
+            </svg>
+          </div>
+        )}
+
+
+
+  <div className={styles.canvasChatBar}>
+      <input
+            type="text"
+    placeholder="Write a message..."
+            value={chatInput}
+            onChange={e => setChatInput(e.target.value)}
+            disabled={isSending}
+      suppressHydrationWarning
+      autoComplete="off"
+          />
+          <button
+            className={styles.sendBtn || 'sendBtn'}
+            aria-label="send message"
+            onClick={(e) => { e.preventDefault(); handleChatSubmit(e as any); }}
+            disabled={isSending || !chatInput.trim()}
+          >
+            ⤴
+          </button>
+        </div>
       </div>
     </main>
   );

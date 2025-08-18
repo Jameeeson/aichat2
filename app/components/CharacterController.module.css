@@ -3,9 +3,26 @@
   width: 100vw;
   height: 100vh;
   position: relative;
-  background: #111;
   overflow: hidden;
+  /* blue vertical gradient to match the main app canvas background */
+  background: linear-gradient(180deg,#0b3358 0%, #062842 100%);
 }
+
+/* subtle repeating SVG overlay like the main app */
+.container::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background-image: url('/wave.png');
+  background-repeat: repeat-x;
+  background-position: top center;
+  opacity: 0.06;
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* ensure content sits above the overlay */
+.container > * { position: relative; z-index: 1; }
 
 .uiPanel {
   position: absolute;
