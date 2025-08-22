@@ -7,7 +7,13 @@ import styles from "./CharacterController.module.css";
 // Make sure to import the Emotion type as well
 import type { ThreeCanvasHandles, Emotion } from "./ThreeCanvas";
 
-const BACKEND_URL = "http://3.34.142.34:5001";
+// Remove bracketed tokens like [Wave] or [Talkinganimation] for UI display
+const sanitizeResponse = (text: string | null | undefined) => {
+  if (!text) return "";
+  return String(text).replace(/\[[^\]]*\]/g, "").replace(/\s+/g, " ").trim();
+};
+
+const BACKEND_URL = "http://43.203.245.169:5001";
 
 // Character and background definitions
 const characters = {
@@ -16,8 +22,8 @@ const characters = {
     modelUrl: "/models/Harry.glb",
     introAnimationUrl: "/idleanimations/harryuniqueidle.fbx",
     idleAnimationUrl: "/idleanimations/StandIdle.fbx",
-    interruptAnimationUrl: "/idleanimations/Boyidle.fbx",
-    animationUrl: "/idleanimations/LookingAround.fbx",
+    interruptAnimationUrl: "/idleanimations/StandIdle.fbx",
+    animationUrl: "/idleanimations/StandIdle.fbx",
     talkingAnimationUrl1: "/talkinganimations/Talking2.fbx",
     talkingAnimationUrl2: "/talkinganimations/Talking2.fbx",
   },
@@ -89,6 +95,13 @@ export default function CharacterController() {
     setIsChatVisible(true);
 
     try {
+      // Reset character bones/animation to idle immediately when user submits
+      try {
+        canvasRef.current?.resetToIdle?.();
+      } catch (e) {
+        console.warn('Failed to reset character to idle on submit', e);
+      }
+
       const companionResponse = await fetch(`${BACKEND_URL}/api/companion`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -100,11 +113,14 @@ export default function CharacterController() {
       });
       if (!companionResponse.ok)
         throw new Error(`API failed: ${companionResponse.status}`);
-      const companionJson = await companionResponse.json();
-      const { response: answer } = companionJson;
+  const companionJson = await companionResponse.json();
+  console.log("CharacterController: full companion JSON:", companionJson);
+  const { response: answer, mixamo_animation } = companionJson;
       if (!answer) throw new Error("Invalid response from companion");
 
-      setChatMessage(answer);
+  setChatMessage(sanitizeResponse(answer));
+      // If the backend returned a Mixamo gesture name, tell the canvas to play it.
+  // mixamo_animation handling removed — gestures are no longer supported
       setStatus("Generating audio...");
       setTalkPrompt("");
 
@@ -121,17 +137,36 @@ export default function CharacterController() {
       const audioJson = await audioResponse.json();
       const { audio_base64, visemes, emotion } = audioJson; // Expect emotion from backend
 
-      if (canvasRef.current && audio_base64) {
+  if (canvasRef.current && audio_base64) {
         setIsAudioPlaying(true);
         setStatus("Talking...");
 
         // --- FIX 1: Use the correct function and pass the emotion ---
         const audioDataUri = `data:audio/mp3;base64,${audio_base64}`;
-        await canvasRef.current.playAudioWithEmotionAndLipSync(
+        // Start speech in parallel with any gestures
+        const speechPromise = canvasRef.current.playAudioWithEmotionAndLipSync(
           audioDataUri,
           visemes || [],
           emotion || "neutral"
         );
+
+        // If backend suggested a Mixamo gesture (string or array), play it as overlay(s)
+        if (mixamo_animation && canvasRef.current.playGestures) {
+          try {
+            const urls = Array.isArray(mixamo_animation)
+              ? mixamo_animation
+              : [mixamo_animation];
+            // Convert backend paths (/gesturesanimation/Waving.fbx) to frontend URLs if necessary
+            const converted = urls.map((p) => (p.startsWith('/') ? p : `/gesturesanimation/${p}`));
+            console.log('CharacterController: playing gestures', converted);
+            // Play gestures but don't await here so they overlay the talking animation
+            canvasRef.current.playGestures(converted).catch((e) => console.warn(e));
+          } catch (err) {
+            console.warn('Failed to play gestures', err);
+          }
+        }
+
+        await speechPromise;
 
         setIsAudioPlaying(false);
       }
@@ -354,6 +389,7 @@ export default function CharacterController() {
             introAnimationUrl={selectedCharacter.introAnimationUrl}
             idleAnimationUrl={selectedCharacter.idleAnimationUrl}
             interruptAnimationUrl={selectedCharacter.interruptAnimationUrl}
+            animationUrl={selectedCharacter.animationUrl}
             talkingAnimationUrl1={selectedCharacter.talkingAnimationUrl1}
             talkingAnimationUrl2={selectedCharacter.talkingAnimationUrl2}
             // --- FIX 3: Remove the invalid prop ---

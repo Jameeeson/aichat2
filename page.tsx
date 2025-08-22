@@ -1,11 +1,11 @@
 'use client';
 
 import { useState, useRef } from 'react'; // NEW: Add useRef
-import ThreeCanvas from '../app/components/ThreeCanvas';
+import ThreeCanvas from './app/components/ThreeCanvas';
 import styles from './page.module.css';
 
 // Import the ThreeCanvasHandles type from the ThreeCanvas component
-import type { ThreeCanvasHandles } from '../app/components/ThreeCanvas';
+import type { ThreeCanvasHandles } from './app/components/ThreeCanvas';
 
 // NEW: Define the backend URL
 const BACKEND_URL = "http://localhost:9093";
@@ -101,8 +101,12 @@ export default function Home() {
       // Step 2: Tell the ThreeCanvas to play the audio with lip-sync
       if (canvasRef.current && audio_base64) {
         // Pass visemes if they exist, otherwise pass an empty array.
-        // This allows audio to play even without lip-sync data.
-        await canvasRef.current.playAudioWithLipSync(audio_base64, visemes || []);
+        // Prefer the legacy helper if present, otherwise call the primary API.
+        if (typeof canvasRef.current.playAudioWithLipSync === "function") {
+          await canvasRef.current.playAudioWithLipSync(audio_base64, visemes || []);
+        } else {
+          await canvasRef.current.playAudioWithEmotionAndLipSync(audio_base64, visemes || [], "neutral");
+        }
       }
 
       // Step 3: If the backend decided to generate a motion, play it.

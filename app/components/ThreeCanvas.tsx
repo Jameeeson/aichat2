@@ -42,6 +42,20 @@ const backgrounds = {
   },
 };
 
+// ===== Editable mappings =====
+// Map backend animation names to FBX URLs served from /public
+// Edit these to match the filenames on disk (case-sensitive on Linux).
+
+// Map logical idle names to idle FBX urls for easy customization.
+// Use the 'default' key for a fallback idle animation.
+export const idleAnimationMap: Record<string, string> = {
+  default: "/idleanimations/StandIdle.fbx",
+  harry: "/idleanimations/harryuniqueidle.fbx",
+  Joy: "/idleanimations/Joyuniqueidle.fbx",
+  Surf: "/idleanimations/Surfuniqueidle.fbx",
+};
+
+
 export type Emotion =
   | "neutral"
   | "happy"
@@ -60,11 +74,21 @@ export interface ThreeCanvasHandles {
   ) => Promise<void>;
   playAnimation: (url: string) => Promise<void>;
   setStaticEmotion: (emotion: Emotion) => void;
+  // Control a typing/waiting pose
+  setTyping: (isTyping: boolean) => void;
   getAnimationObjects: () => {
     mixer: THREE.AnimationMixer | null;
     model: THREE.Object3D | null;
     idleAction: THREE.AnimationAction | null;
   };
+  // Play a Mixamo gesture/animation by name (maps to /gesturesanimation/<name>.fbx)
+  // playMixamoAnimation was removed; gesture playback is no longer supported.
+  // Backwards-compatible alias used elsewhere
+  playAudioWithLipSync?: (audioBase64OrUrl: string, visemes: any[]) => Promise<void>;
+  // Play one or more Mixamo FBX gestures (paths served from /public)
+  playGestures?: (urls: string[] | string) => Promise<void>;
+  // Reset skeleton, stop all actions, and return to idle loop
+  resetToIdle?: () => void;
 }
 
 export interface ThreeCanvasProps {
@@ -72,10 +96,16 @@ export interface ThreeCanvasProps {
   idleAnimationUrl: string;
   introAnimationUrl?: string;
   interruptAnimationUrl?: string;
+  // New: an additional ambient/idle variant animation to include in the idle cycle
+  animationUrl?: string;
   talkingAnimationUrl1?: string;
   talkingAnimationUrl2?: string;
+  // Play once and hold final frame while user types
+  typingAnimationUrl?: string;
   backgroundData?: BackgroundData;
   backgroundPreset?: keyof typeof backgrounds;
+  // compatibility: optional UI tweak used by other pages
+  smileIntensity?: number;
 }
 
 const boneNameMap: { [key: string]: string } = {
@@ -167,6 +197,38 @@ const RPM_TPOSE_RETARGET_OPTIONS = {
   },
 };
 
+// Explicit retarget map for Mixamo FBX clips (source bone names use "mixamorig:" prefix)
+const MIXAMO_RETARGET_OPTIONS = {
+  preservePosition: false,
+  useFirstFrameAsBindPose: false,
+  hip: "Hips",
+  names: {
+  Hips: "mixamorigHips",
+  Spine: "mixamorigSpine",
+  Spine1: "mixamorigSpine1",
+  Spine2: "mixamorigSpine2",
+  Neck: "mixamorigNeck",
+  Head: "mixamorigHead",
+  LeftShoulder: "mixamorigLeftShoulder",
+  LeftArm: "mixamorigLeftArm",
+  LeftForeArm: "mixamorigLeftForeArm",
+  LeftHand: "mixamorigLeftHand",
+  RightShoulder: "mixamorigRightShoulder",
+  RightArm: "mixamorigRightArm",
+  RightForeArm: "mixamorigRightForeArm",
+  RightHand: "mixamorigRightHand",
+  LeftUpLeg: "mixamorigLeftUpLeg",
+  LeftLeg: "mixamorigLeftLeg",
+  LeftFoot: "mixamorigLeftFoot",
+  LeftToe: "mixamorigLeftToeBase",
+  RightUpLeg: "mixamorigRightUpLeg",
+  RightLeg: "mixamorigRightLeg",
+  RightFoot: "mixamorigRightFoot",
+  RightToe: "mixamorigRightToeBase",
+    // Fingers intentionally omitted to avoid over-rotation artifacts
+  },
+};
+
 const bvhRetargetMap = {
 
   preservePosition: false,
@@ -238,9 +300,11 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
       characterModelUrl,
       idleAnimationUrl,
       introAnimationUrl,
-      interruptAnimationUrl,
+  interruptAnimationUrl,
+  animationUrl,
       talkingAnimationUrl1,
       talkingAnimationUrl2,
+  typingAnimationUrl,
       backgroundData,
       backgroundPreset = "studio",
     },
@@ -282,6 +346,19 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
       },
     };
 
+    // Helper: find the primary SkinnedMesh (with the largest number of bones)
+    const findBestSkinnedMesh = (root: THREE.Object3D): THREE.SkinnedMesh | null => {
+      let best: THREE.SkinnedMesh | null = null;
+      root.traverse((o: any) => {
+        if (o?.isSkinnedMesh && o.skeleton && Array.isArray(o.skeleton.bones)) {
+          if (!best || o.skeleton.bones.length > (best.skeleton?.bones?.length || 0)) {
+            best = o as THREE.SkinnedMesh;
+          }
+        }
+      });
+      return best;
+    };
+
     const targetVisemeWeights = useRef<{ [key: string]: number }>({}).current;
     const targetJawOpen = useRef(0);
     const targetEmotionWeights = useRef<{ [key: string]: number }>({}).current;
@@ -299,8 +376,83 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
     const isWaitingAfterTalkRef = useRef<boolean>(false);
     const currentVisemeIndexRef = useRef(0);
     const audioRef = useRef<THREE.Audio | null>(null);
+    const audioContextRef = useRef<AudioContext | null>(null);
+    const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
     const currentSpeechEmotionRef = useRef<Emotion>("neutral");
     const speechEmotionIntensityRef = useRef(0);
+
+  // (Mixamo/gesture support removed) no-op queue removed
+
+  // Idle-cycle state: we will loop idle -> interrupt -> animationUrl -> ...
+  const loopActionsRef = useRef<THREE.AnimationAction[]>([]);
+  const currentLoopIndexRef = useRef<number>(-1);
+  const currentLoopActionRef = useRef<THREE.AnimationAction | null>(null);
+  const loopEnabledRef = useRef<boolean>(false);
+
+  // Typing pose/action
+  const typingActionRef = useRef<THREE.AnimationAction | null>(null);
+  const typingActiveRef = useRef<boolean>(false);
+  // Frozen typing pose quaternions captured at the end of the typing action
+  const typingHeadQuatRef = useRef<THREE.Quaternion | null>(null);
+  const typingNeckQuatRef = useRef<THREE.Quaternion | null>(null);
+  const typingHoldTimeoutRef = useRef<number | null>(null);
+
+  const clearTypingHoldTimeout = () => {
+    if (typingHoldTimeoutRef.current) {
+      window.clearTimeout(typingHoldTimeoutRef.current);
+      typingHoldTimeoutRef.current = null;
+    }
+  };
+
+  const releaseTypingPose = (holdMs = 1600) => {
+    // Clear any previous timer and set a new one to release the frozen typing pose
+    clearTypingHoldTimeout();
+    typingHoldTimeoutRef.current = window.setTimeout(() => {
+      typingHoldTimeoutRef.current = null;
+      // Only proceed if typing is still considered active (we captured a pose)
+      typingActiveRef.current = false;
+      try {
+        const playlist = loopActionsRef.current;
+        if (playlist.length > 0) {
+          const prev = currentLoopActionRef.current;
+          if (prev?.isRunning()) prev.fadeOut(0.25);
+          currentLoopIndexRef.current = (currentLoopIndexRef.current + 1) % playlist.length;
+          const next = playlist[currentLoopIndexRef.current];
+          next.reset().setEffectiveWeight(1).fadeIn(0.25).play();
+          currentLoopActionRef.current = next;
+        } else if (idleActionRef.current) {
+          idleActionRef.current.reset().setEffectiveWeight(1).fadeIn(0.25).play();
+        }
+      } catch (err) {
+        // ignore
+      }
+      // clear frozen quaternions so subsequent animations are not clobbered
+      typingHeadQuatRef.current = null;
+      typingNeckQuatRef.current = null;
+    }, holdMs);
+  };
+
+  // Bone refs for subtle procedural motion during interrupt animation
+  const neckBoneRef = useRef<THREE.Bone | null>(null);
+  const headBoneRef = useRef<THREE.Bone | null>(null);
+  const neckBaseQuatRef = useRef(new THREE.Quaternion());
+  const headBaseQuatRef = useRef(new THREE.Quaternion());
+  const hasCapturedBasePoseRef = useRef(false);
+
+    // Additional bones for idle micro-motions
+    const hipsBoneRef = useRef<THREE.Bone | null>(null);
+    const spineRef = useRef<THREE.Bone | null>(null);
+    const spine1Ref = useRef<THREE.Bone | null>(null);
+    const spine2Ref = useRef<THREE.Bone | null>(null);
+    const leftShoulderRef = useRef<THREE.Bone | null>(null);
+    const rightShoulderRef = useRef<THREE.Bone | null>(null);
+    // Randomized phases to desynchronize motions
+    const motionPhase = useRef({
+      breath: Math.random() * Math.PI * 2,
+      sway: Math.random() * Math.PI * 2,
+      shoulder: Math.random() * Math.PI * 2,
+      head: Math.random() * Math.PI * 2,
+    }).current;
 
     // Camera/model follow & reset helpers
     const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
@@ -310,6 +462,9 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
     const controlsStartTargetRef = useRef(new THREE.Vector3());
     const cameraOffsetRef = useRef(new THREE.Vector3());
     const controlsOffsetRef = useRef(new THREE.Vector3());
+  // Last known good finite camera transform (for recovering from NaN/Infinity)
+  const lastGoodCameraPosRef = useRef(new THREE.Vector3(0, 1, 3));
+  const lastGoodCameraQuatRef = useRef(new THREE.Quaternion());
     const modelRootRef = useRef<THREE.Object3D | null>(null);
     const modelStartPosRef = useRef(new THREE.Vector3());
     const modelStartQuatRef = useRef(new THREE.Quaternion());
@@ -324,22 +479,26 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
   // Desired front-view camera settings during follow (tweak to taste)
   // Use a small distance and zero side to stay centered and closer to the character.
   // Lowered height so follow view isn't too high above the character.
-  const followViewRef = useRef({ distance: 3, height: 0, side: 1.2 });
+  const followViewRef = useRef({ distance: 2, height: 0, side: 1.2 });
 
-    const playAudioWithEmotionAndLipSync = async (
+      const playAudioWithEmotionAndLipSync = async (
       audioUrl: string,
       visemes: { time: number; value: string; jaw: number }[],
       emotion: Emotion,
       onEndedCallback?: () => void
     ) => {
-      const audio = audioRef.current;
       const faceMesh = faceMeshRef.current;
-      if (!audio || !faceMesh) {
-        return;
-      }
-      if (audio.isPlaying) {
-        audio.stop();
-      }
+      if (!faceMesh) return;
+
+      // Stop any previous scheduled source
+      try {
+        if (audioSourceRef.current) {
+          try { audioSourceRef.current.onended = null; } catch {}
+          try { audioSourceRef.current.stop(); } catch {}
+          audioSourceRef.current.disconnect();
+          audioSourceRef.current = null;
+        }
+      } catch (e) {}
 
       isWaitingAfterTalkRef.current = false;
       currentVisemeIndexRef.current = 0;
@@ -349,47 +508,107 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
       targetJawOpen.current = 0;
       currentSpeechEmotionRef.current = emotion;
 
-      return new Promise<void>((resolve) => {
-        new THREE.AudioLoader().load(
-          audioUrl,
-          (buffer) => {
-            audio.setBuffer(buffer);
-            audio.onEnded = () => {
-              isWaitingAfterTalkRef.current = true;
-              audio.onEnded = () => {};
-              setTimeout(() => {
-                if (faceMesh) {
-                  faceMesh.userData.visemes = [];
-                }
-                isWaitingAfterTalkRef.current = false;
-                currentSpeechEmotionRef.current = "neutral";
-                if (onEndedCallback) onEndedCallback();
-                resolve();
-              }, 2000);
-            };
-            audio.play();
-            faceMesh.userData.visemes = visemes;
-            faceMesh.userData.audioStartTime = performance.now();
-          },
-          undefined,
-          (err) => {
-            console.error(err);
-            resolve();
-          }
-        );
+      // Ensure AudioContext
+      const AudioCtor: any = window.AudioContext || (window as any).webkitAudioContext;
+      if (!audioContextRef.current && AudioCtor) audioContextRef.current = new AudioCtor();
+      const audioCtx = audioContextRef.current;
+      if (!audioCtx) {
+        // Fallback: no WebAudio available; keep previous behavior using THREE.AudioLoader
+        console.warn('No AudioContext available; cannot schedule audio precisely.');
+        return Promise.resolve();
+      }
+
+      return new Promise<void>(async (resolve) => {
+        try {
+          // Fetch and decode audio (works for data: URIs and remote urls)
+          const resp = await fetch(audioUrl);
+          const arrayBuffer = await resp.arrayBuffer();
+          const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
+
+          const source = audioCtx.createBufferSource();
+          source.buffer = audioBuffer;
+          source.connect(audioCtx.destination);
+          audioSourceRef.current = source;
+
+          source.onended = () => {
+            isWaitingAfterTalkRef.current = true;
+            source.onended = null;
+            setTimeout(() => {
+              if (faceMesh) {
+                faceMesh.userData.visemes = [];
+              }
+              isWaitingAfterTalkRef.current = false;
+              currentSpeechEmotionRef.current = "neutral";
+              if (onEndedCallback) onEndedCallback();
+              resolve();
+            }, 2000);
+          };
+
+          // Small scheduling delay to ensure decode/time alignment
+          const startTime = audioCtx.currentTime + 0.06;
+          faceMesh.userData.visemes = visemes;
+          // store audio start time as AudioContext time (seconds)
+          faceMesh.userData.audioStartTime = startTime;
+
+          source.start(startTime);
+        } catch (err) {
+          console.error('playAudioWithEmotionAndLipSync scheduling error', err);
+          resolve();
+        }
       });
     };
 
     const retargetClip = (clip: THREE.AnimationClip) => {
-      clip.tracks = clip.tracks.filter(
-        (track) => track.name !== "mixamorigHips.position"
-      );
+      try {
+        // Debug: show original track names (first few)
+        console.log(
+          "ThreeCanvas: FBX clip original tracks:",
+          clip.tracks.slice(0, 8).map((t) => t.name)
+        );
+      } catch {}
+
+      // Helper to canonicalize FBX bone names like "mixamorig:Hips" -> "mixamorigHips"
+      const canonicalize = (name: string) => name.replace(/mixamorig:/gi, "mixamorig");
+
+      // Drop root translation tracks that can yank the model around
+      clip.tracks = clip.tracks.filter((track) => {
+        const bone = track.name.split(".")[0];
+        const canon = canonicalize(bone);
+        const isRootPos =
+          track.name.endsWith(".position") &&
+          (canon === "mixamorigHips" || canon === "Hips");
+        return !isRootPos;
+      });
+
       clip.tracks.forEach((track) => {
-        const boneName = track.name.split(".")[0];
-        if (boneNameMap[boneName]) {
-          track.name = track.name.replace(boneName, boneNameMap[boneName]);
+        const parts = track.name.split(".");
+        const boneRaw = parts[0];
+        const canon = canonicalize(boneRaw);
+        let targetBone = boneNameMap[canon];
+        if (!targetBone) {
+          // If it's already a target-style bone name (e.g., "Hips", "Spine1"), keep it
+          if (/^(Hips|Spine|Spine1|Spine2|Neck|Head|Left|Right)/.test(canon)) {
+            targetBone = canon; // already correct
+          } else if (/^mixamorig/i.test(canon)) {
+            // Strip the mixamorig prefix and try the remainder (e.g., mixamorigLeftArm -> LeftArm)
+            const stripped = canon.replace(/^mixamorig/i, "");
+            if (boneNameMap[stripped]) targetBone = boneNameMap[stripped];
+            else targetBone = stripped; // best effort
+          } else {
+            targetBone = canon; // fallback
+          }
+        }
+        if (targetBone && targetBone !== boneRaw) {
+          track.name = track.name.replace(boneRaw, targetBone);
         }
       });
+
+      try {
+        console.log(
+          "ThreeCanvas: FBX clip retargeted tracks:",
+          clip.tracks.slice(0, 8).map((t) => t.name)
+        );
+      } catch {}
       return clip;
     };
 
@@ -475,6 +694,23 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
         visemes,
         emotion
       ) => {
+        // Ensure typing pose is cleared before speech
+        if (typingActiveRef.current) {
+          typingActiveRef.current = false;
+          const idle = idleActionRef.current;
+          const playlist = loopActionsRef.current;
+          // Resume loop or idle
+          if (playlist.length > 0) {
+            const prev = currentLoopActionRef.current;
+            if (prev?.isRunning()) prev.fadeOut(0.3);
+            currentLoopIndexRef.current = (currentLoopIndexRef.current + 1) % playlist.length;
+            const next = playlist[currentLoopIndexRef.current];
+            next.reset().setEffectiveWeight(1).fadeIn(0.3).play();
+            currentLoopActionRef.current = next;
+          } else if (idle) {
+            idle.reset().setEffectiveWeight(1).fadeIn(0.3).play();
+          }
+        }
         const isBase64 = audioBase64OrUrl.startsWith("data:audio");
         if (isBase64) {
           const audioBlob = await (await fetch(audioBase64OrUrl)).blob();
@@ -495,6 +731,131 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
           );
         }
       },
+      // Backwards-compatible wrapper some pages use
+      playAudioWithLipSync: async (audioBase64OrUrl: string, visemes: any[]) => {
+        // Default to neutral emotion
+        return playAudioWithEmotionAndLipSync(audioBase64OrUrl, visemes || [], "neutral");
+      },
+      // Play one or more Mixamo-style gesture FBX files as one-shot overlays.
+      playGestures: async (urls) => {
+        // Ensure typing pose is released so gestures do not inherit a frozen look-down pose
+        clearTypingHoldTimeout();
+        typingActiveRef.current = false;
+        typingHeadQuatRef.current = null;
+        typingNeckQuatRef.current = null;
+        // If we captured a neutral base pose for head/neck, restore it now so gestures start from neutral
+        try {
+          if (hasCapturedBasePoseRef.current) {
+            if (headBoneRef.current) headBoneRef.current.quaternion.copy(headBaseQuatRef.current);
+            if (neckBoneRef.current) neckBoneRef.current.quaternion.copy(neckBaseQuatRef.current);
+            // Also reset the model root transform so gestures start facing the original front
+            if (modelRootRef.current) {
+              modelRootRef.current.position.copy(modelStartPosRef.current);
+              modelRootRef.current.quaternion.copy(modelStartQuatRef.current);
+              (modelRootRef.current as any)?.updateMatrixWorld?.(true);
+            }
+          }
+        } catch (e) {}
+
+        const fbxLoader = new FBXLoader();
+        const list = Array.isArray(urls) ? urls : [urls];
+
+        // Wait for the mixer and body mesh to be ready (in case caller fires early)
+        const waitForReady = async (timeoutMs = 5000) => {
+          const start = performance.now();
+          while (performance.now() - start < timeoutMs) {
+            if (mixerRef.current && bodyMeshRef.current) return true;
+            // small backoff
+            await new Promise((r) => setTimeout(r, 100));
+          }
+          return false;
+        };
+
+        const ready = await waitForReady(5000);
+        if (!ready) {
+          console.warn('ThreeCanvas.playGestures: mixer/model not ready after wait; aborting gestures');
+          return;
+        }
+
+        const mixer = mixerRef.current as THREE.AnimationMixer;
+        const target = bodyMeshRef.current as THREE.Object3D;
+
+        for (const u of list) {
+          const url = String(u);
+          console.log('ThreeCanvas.playGestures: loading', url);
+          try {
+            const loaded: any = await fbxLoader.loadAsync(url);
+            if (!loaded || !loaded.animations || loaded.animations.length === 0) {
+              console.warn('ThreeCanvas.playGestures: no animations in', url);
+              continue;
+            }
+            const clip = retargetClip(loaded.animations[0].clone());
+
+            // Dedupe quaternion tracks for hands to avoid sudden wrist flips
+            const seenQuat = new Set<string>();
+            const deduped: THREE.KeyframeTrack[] = [];
+            for (const track of clip.tracks) {
+              if (
+                track.name.endsWith('.quaternion') &&
+                (track.name.startsWith('LeftHand.') || track.name.startsWith('RightHand.'))
+              ) {
+                if (seenQuat.has(track.name)) continue;
+                seenQuat.add(track.name);
+              }
+              deduped.push(track);
+            }
+            clip.tracks = deduped;
+
+            const action = mixer.clipAction(clip as any, target as any);
+            action.setLoop(THREE.LoopOnce, 1);
+            action.clampWhenFinished = true;
+
+            // Fade out current talking/loop/idle action to make gesture visible
+            console.log('ThreeCanvas.playGestures: starting gesture, fading out base animations');
+            const prevTalking = currentlyPlayingTalkingActionRef.current;
+            const prevLoop = currentLoopActionRef.current;
+            const idle = idleActionRef.current;
+            try {
+              if (prevTalking?.isRunning()) {
+                prevTalking.fadeOut(0.15);
+              } else if (prevLoop?.isRunning()) {
+                prevLoop.fadeOut(0.15);
+              } else if (idle?.isRunning()) {
+                idle.fadeOut(0.15);
+              }
+            } catch (e) {
+              // ignore
+            }
+
+            action.reset().setEffectiveWeight(1).fadeIn(0.15).play();
+
+            await new Promise<void>((resolve) => {
+              const onFinished = (e: any) => {
+                if (e.action === action) {
+                  try { mixer.removeEventListener('finished', onFinished); } catch {}
+                  action.fadeOut(0.15);
+                  // Restore previous actions
+                  try {
+                    if (prevTalking) {
+                      prevTalking.reset().setEffectiveWeight(1).fadeIn(0.2).play();
+                    } else if (prevLoop) {
+                      prevLoop.reset().setEffectiveWeight(1).fadeIn(0.2).play();
+                    } else if (idle) {
+                      idle.reset().setEffectiveWeight(1).fadeIn(0.2).play();
+                    }
+                  } catch (err) {}
+                  resolve();
+                }
+              };
+              mixer.addEventListener('finished', onFinished);
+            });
+            console.log('ThreeCanvas.playGestures: finished', url);
+          } catch (err) {
+            console.warn('ThreeCanvas.playGestures: failed to load/play', url, err);
+            continue;
+          }
+        }
+      },
       playAnimation: (url) => {
         const mixer = mixerRef.current;
         const idleAction = idleActionRef.current;
@@ -512,8 +873,27 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
               }
 
               // Clean reset like debug.html
+              // Release any frozen typing pose so BVH retarget doesn't inherit a look-down
+              clearTypingHoldTimeout();
+              typingActiveRef.current = false;
+              typingHeadQuatRef.current = null;
+              typingNeckQuatRef.current = null;
+
               mixer.stopAllAction();
               bodyMesh.skeleton.pose();
+              // Restore neutral head/neck base pose if available so BVH starts from a neutral orientation
+              try {
+                if (hasCapturedBasePoseRef.current) {
+                  if (headBoneRef.current) headBoneRef.current.quaternion.copy(headBaseQuatRef.current);
+                  if (neckBoneRef.current) neckBoneRef.current.quaternion.copy(neckBaseQuatRef.current);
+                  // Reset the model root transform so BVH starts facing forward
+                  if (modelRootRef.current) {
+                    modelRootRef.current.position.copy(modelStartPosRef.current);
+                    modelRootRef.current.quaternion.copy(modelStartQuatRef.current);
+                    (modelRootRef.current as any)?.updateMatrixWorld?.(true);
+                  }
+                }
+              } catch (e) {}
 
               // Optional: strip root translation if needed
               // const stripped = bvh.clip.clone();
@@ -544,7 +924,7 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
               }
               clip.tracks = deduped;
 
-              const action = mixer.clipAction(clip);
+              const action = mixer.clipAction(clip, bodyMesh);
               action.setLoop(THREE.LoopOnce, 1);
               action.clampWhenFinished = true;
 
@@ -567,10 +947,9 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
                 const right = new THREE.Vector3(1, 0, 0).applyQuaternion(q);
                 const up = new THREE.Vector3(0, 1, 0).applyQuaternion(q);
                 const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(q);
-                const { distance, height, side } = followViewRef.current;
+                const { distance, side } = followViewRef.current;
                 cameraOffsetRef.current
                   .copy(right).multiplyScalar(side)
-                  .addScaledVector(up, height)
                   .addScaledVector(forward, -distance);
                 // Debug log so we can verify the follow anchor and offset
                 console.log("follow enabled: anchor=", anchor.name || '(root)', "anchorPos=", anchorPos.toArray(), "offset=", cameraOffsetRef.current.toArray());
@@ -669,6 +1048,143 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
       setStaticEmotion: (emotion) => {
         currentSpeechEmotionRef.current = emotion;
       },
+      setTyping: (isTyping: boolean) => {
+        const mixer = mixerRef.current;
+        const idle = idleActionRef.current;
+        const typingAction = typingActionRef.current;
+        if (!mixer || !idle || !typingAction) {
+          // If typing action isn't available yet, try to load it asynchronously
+          if (!mixer || !idle) {
+            typingActiveRef.current = false;
+            return;
+          }
+          // Mark desired state and attempt to load/create the typing action
+          typingActiveRef.current = isTyping;
+          (async () => {
+            try {
+              const fbxLoader = new FBXLoader();
+              const candidates = [
+                typingAnimationUrl,
+                "/idleanimations/waitingprompt.fbx",
+                "/idleanimations/waiting.fbx",
+              ].filter(Boolean) as string[];
+              let loaded: any = null;
+              for (const url of candidates) {
+                try {
+                  loaded = await fbxLoader.loadAsync(url);
+                  console.log("ThreeCanvas: dynamically loaded typing animation:", url);
+                  break;
+                } catch (e) {
+                  console.warn("ThreeCanvas: failed to load typing candidate:", url, e);
+                }
+              }
+              if (!loaded || !loaded.animations || loaded.animations.length === 0) {
+                console.warn("ThreeCanvas: no typing animation found after dynamic load");
+                typingActiveRef.current = false;
+                return;
+              }
+              const clip = retargetClip(loaded.animations[0].clone());
+              const target = bodyMeshRef.current;
+              if (!target) {
+                console.warn("ThreeCanvas: body mesh missing, cannot bind typing action");
+                typingActiveRef.current = false;
+                return;
+              }
+              const ta = mixer.clipAction(clip, target);
+              ta.setLoop(THREE.LoopOnce, 1);
+              ta.clampWhenFinished = true;
+              typingActionRef.current = ta;
+              // If caller still wants typing, play now
+              if (typingActiveRef.current) {
+                if (currentLoopActionRef.current?.isRunning()) currentLoopActionRef.current.fadeOut(0.25);
+                else if (idle.isRunning()) idle.fadeOut(0.25);
+                ta.reset().setEffectiveWeight(1).fadeIn(0.25).play();
+              }
+              // Capture final pose when this dynamically loaded typing action finishes
+              const onDynFinished = (e: any) => {
+                if (e.action === ta) {
+                  try { mixer.removeEventListener("finished", onDynFinished); } catch {}
+                  const head = headBoneRef.current;
+                  const neck = neckBoneRef.current;
+                  if (head) typingHeadQuatRef.current = head.quaternion.clone();
+                  if (neck) typingNeckQuatRef.current = neck.quaternion.clone();
+                  // Release the frozen typing pose after a short hold so we don't stay looking down
+                  releaseTypingPose(1400);
+                }
+              };
+              mixer.addEventListener("finished", onDynFinished);
+            } catch (err) {
+              console.warn("ThreeCanvas: error loading typing animation", err);
+              typingActiveRef.current = false;
+            }
+          })();
+          return;
+        }
+        if (isTyping) {
+          // If already in typing mode, don't restart the pose
+          if (typingActiveRef.current) return;
+          typingActiveRef.current = true;
+          // Fade out any loop/idle action, then play typing pose once and hold
+          if (currentLoopActionRef.current?.isRunning()) {
+            currentLoopActionRef.current.fadeOut(0.25);
+          } else if (idle.isRunning()) {
+            idle.fadeOut(0.25);
+          }
+          typingAction.reset().setEffectiveWeight(1).fadeIn(0.25).play();
+        } else {
+          if (!typingActiveRef.current) return;
+          typingActiveRef.current = false;
+          // Clear any hold timer and frozen quats
+          clearTypingHoldTimeout();
+          typingHeadQuatRef.current = null;
+          typingNeckQuatRef.current = null;
+          // Return to loop or idle
+          const playlist = loopActionsRef.current;
+          if (playlist.length > 0) {
+            const prev = currentLoopActionRef.current;
+            if (prev?.isRunning()) prev.fadeOut(0.25);
+            currentLoopIndexRef.current = (currentLoopIndexRef.current + 1) % playlist.length;
+            const next = playlist[currentLoopIndexRef.current];
+            next.reset().setEffectiveWeight(1).fadeIn(0.25).play();
+            currentLoopActionRef.current = next;
+          } else {
+            idle.reset().setEffectiveWeight(1).fadeIn(0.25).play();
+          }
+        }
+      },
+      // Reset the skeleton, stop all actions and return to the idle loop.
+      resetToIdle: () => {
+        try {
+          const mixer = mixerRef.current;
+          const body = bodyMeshRef.current;
+          const idle = idleActionRef.current;
+          // Stop any running actions
+          if (mixer) mixer.stopAllAction();
+          // Restore skeleton bind pose
+          if (body && body.skeleton) body.skeleton.pose();
+          // Reset model root transform
+          if (modelRootRef.current) {
+            modelRootRef.current.position.copy(modelStartPosRef.current);
+            modelRootRef.current.quaternion.copy(modelStartQuatRef.current);
+            (modelRootRef.current as any).updateMatrixWorld?.(true);
+          }
+          // Clear typing state
+          typingActiveRef.current = false;
+          clearTypingHoldTimeout();
+          typingHeadQuatRef.current = null;
+          typingNeckQuatRef.current = null;
+          // Reset loop/talking pointers
+          currentLoopActionRef.current = null;
+          currentlyPlayingTalkingActionRef.current = null;
+          animationStateRef.current = "idle";
+          // Ensure idle is playing
+          if (idle) {
+            idle.reset().setEffectiveWeight(1).fadeIn(FADE_DURATION).play();
+          }
+        } catch (err) {
+          // ignore errors during best-effort reset
+        }
+      },
       getAnimationObjects: () => {
         return {
           mixer: mixerRef.current,
@@ -676,7 +1192,10 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
           idleAction: idleActionRef.current,
         };
       },
-    }));
+  // Mixamo/gesture API removed — callers should no longer invoke this.
+  }));
+
+  // Mixamo/gesture internal implementation removed.
 
     // Handle assets after Promise.all resolves. Pulled out as a helper to keep
     // the main effect body short and easier to read.
@@ -696,10 +1215,12 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
       const talkingFbx2 = talkingAnimationUrl2 ? (assets[assetIndex++] as any) : null;
       const characterModel = gltf.scene;
       scene.add(characterModel);
-      bodyMeshRef.current = characterModel.getObjectByProperty(
-        "isSkinnedMesh",
-        true
-      ) as THREE.SkinnedMesh;
+      bodyMeshRef.current =
+        findBestSkinnedMesh(characterModel) ||
+        (characterModel.getObjectByProperty(
+          "isSkinnedMesh",
+          true
+        ) as THREE.SkinnedMesh);
 
       // Store model root and its starting transform for reset
       modelRootRef.current = characterModel;
@@ -726,7 +1247,8 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
       });
 
       const idleAction = mixerRef.current.clipAction(
-        retargetClip(idleFbx.animations[0])
+        retargetClip(idleFbx.animations[0]),
+        bodyMeshRef.current
       );
       idleAction.setLoop(THREE.LoopRepeat, Infinity);
       idleAction.play();
@@ -739,7 +1261,8 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
 
       if (introFbx) {
         introAction = mixerRef.current.clipAction(
-          retargetClip(introFbx.animations[0])
+          retargetClip(introFbx.animations[0]),
+          bodyMeshRef.current
         );
         introAction.setLoop(THREE.LoopOnce, 1);
         introAction.clampWhenFinished = true;
@@ -748,7 +1271,8 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
       }
       if (interruptFbx) {
         interruptAction = mixerRef.current.clipAction(
-          retargetClip(interruptFbx.animations[0])
+          retargetClip(interruptFbx.animations[0]),
+          bodyMeshRef.current
         );
         interruptAction.setLoop(THREE.LoopOnce, 1);
         interruptAction.clampWhenFinished = true;
@@ -856,14 +1380,15 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
         ground.receiveShadow = true;
         scene.add(ground);
       }
-      const camera = new THREE.PerspectiveCamera(
-        45,
-        currentMount.clientWidth / currentMount.clientHeight,
-        0.1,
-        1000
-      );
+      const safeAspect = currentMount.clientHeight
+        ? currentMount.clientWidth / currentMount.clientHeight
+        : 1;
+      const camera = new THREE.PerspectiveCamera(45, safeAspect, 0.1, 1000);
   // Lowered initial camera Y and moved closer (smaller Z) so follow preserves a lower view.
-  camera.position.set(-0.13, 1.0, 2.61);
+  camera.position.set(-0.13, 1.2, 1.63);
+  // Seed last good camera transform
+  lastGoodCameraPosRef.current.copy(camera.position);
+  lastGoodCameraQuatRef.current.copy(camera.quaternion);
   setCameraPosition({x: camera.position.x, y: camera.position.y, z: camera.position.z});
       const audioListener = new THREE.AudioListener();
       camera.add(audioListener);
@@ -895,7 +1420,9 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
       const clock = new THREE.Clock();
       const gltfLoader = new GLTFLoader();
       const fbxLoader = new FBXLoader();
-      let timeToNextInterrupt = 0;
+  // Random interrupt scheduling is replaced by deterministic idle-cycle;
+  // keeping variables for backward compatibility but not used when loop is enabled.
+  let timeToNextInterrupt = 0;
       let timeUntilBlink = Math.random() * 4 + 2;
       let isBlinking = false,
         blinkProgress = 0;
@@ -916,18 +1443,42 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
         promises.push(fbxLoader.loadAsync(introAnimationUrl));
       if (interruptAnimationUrl)
         promises.push(fbxLoader.loadAsync(interruptAnimationUrl));
+      if (animationUrl)
+        promises.push(fbxLoader.loadAsync(animationUrl));
       if (talkingAnimationUrl1)
         promises.push(fbxLoader.loadAsync(talkingAnimationUrl1));
       if (talkingAnimationUrl2)
         promises.push(fbxLoader.loadAsync(talkingAnimationUrl2));
+      // Always push a typing pose loader with fallbacks
+      promises.push(
+        (async () => {
+          const candidates = [
+            typingAnimationUrl,
+            "/idleanimations/waitingprompt.fbx",
+            "/idleanimations/waiting.fbx",
+          ].filter(Boolean) as string[];
+          for (const url of candidates) {
+            try {
+              const res = await fbxLoader.loadAsync(url);
+              console.log("Loaded typing animation:", url);
+              return res;
+            } catch (e) {
+              console.warn("Failed to load typing animation candidate:", url);
+            }
+          }
+          console.warn("No typing animation loaded; typing pose will be disabled.");
+          return null as any;
+        })()
+      );
       let introAction: THREE.AnimationAction | null = null;
       let interruptAction: THREE.AnimationAction | null = null;
+      let ambientAction: THREE.AnimationAction | null = null;
       let talkingAction1: THREE.AnimationAction | null = null;
       let talkingAction2: THREE.AnimationAction | null = null;
       Promise.all(promises)
         .then((assets) => {
           let assetIndex = 0;
-          const gltf = assets[assetIndex++] as any;
+    const gltf = assets[assetIndex++] as any;
           const idleFbx = assets[assetIndex++] as any;
           const introFbx = introAnimationUrl
             ? (assets[assetIndex++] as any)
@@ -935,18 +1486,22 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
           const interruptFbx = interruptAnimationUrl
             ? (assets[assetIndex++] as any)
             : null;
+          const ambientFbx = animationUrl ? (assets[assetIndex++] as any) : null;
           const talkingFbx1 = talkingAnimationUrl1
             ? (assets[assetIndex++] as any)
             : null;
           const talkingFbx2 = talkingAnimationUrl2
             ? (assets[assetIndex++] as any)
             : null;
+          const typingFbx = assets[assetIndex++] as any;
           const characterModel = gltf.scene;
           scene.add(characterModel);
-          bodyMeshRef.current = characterModel.getObjectByProperty(
-            "isSkinnedMesh",
-            true
-          ) as THREE.SkinnedMesh;
+          bodyMeshRef.current =
+            findBestSkinnedMesh(characterModel) ||
+            (characterModel.getObjectByProperty(
+              "isSkinnedMesh",
+              true
+            ) as THREE.SkinnedMesh);
 
           // Store model root and its starting transform for reset
           modelRootRef.current = characterModel;
@@ -959,8 +1514,8 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
           console.log("--- CHARACTER MODEL BONES (TARGET) ---", modelBones);
           // --- END OF ADDED LOG ---
 
-          // 3. Initialize the mixer with the CORRECT object (the SkinnedMesh)
-          mixerRef.current = new THREE.AnimationMixer(bodyMeshRef.current);
+          // Initialize the mixer on the character root so tracks bind to bones properly
+          mixerRef.current = new THREE.AnimationMixer(characterModel);
           characterModel.traverse((object: any) => {
             if (object.isMesh) object.castShadow = true;
             if (object.isSkinnedMesh && object.morphTargetDictionary) {
@@ -973,68 +1528,204 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
               }
             }
           });
+
+          // Try to locate key bones for subtle motions
+          if (bodyMeshRef.current?.skeleton?.bones) {
+            const bones = bodyMeshRef.current.skeleton.bones;
+            const findBone = (patterns: RegExp[]): THREE.Bone | null => {
+              for (const p of patterns) {
+                const b = bones.find((bn) => p.test(bn.name));
+                if (b) return b;
+              }
+              return null;
+            };
+            neckBoneRef.current = findBone([
+              /^Neck$/i,
+              /mixamorig[:]?Neck/i,
+              /neck/i,
+            ]);
+            headBoneRef.current = findBone([
+              /^Head$/i,
+              /mixamorig[:]?Head/i,
+              /head/i,
+            ]);
+            hipsBoneRef.current = findBone([
+              /^Hips$/i,
+              /mixamorig[:]?Hips/i,
+            ]);
+            spineRef.current = findBone([
+              /^Spine$/i,
+              /mixamorig[:]?Spine$/i,
+            ]);
+            spine1Ref.current = findBone([
+              /^Spine1$/i,
+              /mixamorig[:]?Spine1/i,
+            ]);
+            spine2Ref.current = findBone([
+              /^Spine2$/i,
+              /mixamorig[:]?Spine2/i,
+            ]);
+            leftShoulderRef.current = findBone([
+              /^LeftShoulder$/i,
+              /mixamorig[:]?LeftShoulder/i,
+            ]);
+            rightShoulderRef.current = findBone([
+              /^RightShoulder$/i,
+              /mixamorig[:]?RightShoulder/i,
+            ]);
+            if (neckBoneRef.current) neckBaseQuatRef.current.copy(neckBoneRef.current.quaternion);
+            if (headBoneRef.current) headBaseQuatRef.current.copy(headBoneRef.current.quaternion);
+            hasCapturedBasePoseRef.current = !!(neckBoneRef.current || headBoneRef.current);
+          }
+          // Create actions
           const idleAction = mixerRef.current.clipAction(
-            retargetClip(idleFbx.animations[0])
+            retargetClip(idleFbx.animations[0]),
+            characterModel
           );
+          // Keep idle as the base looping animation
           idleAction.setLoop(THREE.LoopRepeat, Infinity);
+          idleAction.clampWhenFinished = false;
           idleAction.play();
           idleActionRef.current = idleAction;
+
+          // Mixamo/gesture queuing removed.
+
           if (introFbx) {
             introAction = mixerRef.current.clipAction(
-              retargetClip(introFbx.animations[0])
+              retargetClip(introFbx.animations[0]),
+              characterModel
             );
             introAction.setLoop(THREE.LoopOnce, 1);
             introAction.clampWhenFinished = true;
-            idleAction.weight = 0;
             introAction.play();
           }
+
           if (interruptFbx) {
             interruptAction = mixerRef.current.clipAction(
-              retargetClip(interruptFbx.animations[0])
+              retargetClip(interruptFbx.animations[0]),
+              characterModel
             );
             interruptAction.setLoop(THREE.LoopOnce, 1);
             interruptAction.clampWhenFinished = true;
-            setNextInterrupt();
           }
+
+          if (ambientFbx) {
+            ambientAction = mixerRef.current.clipAction(
+              retargetClip(ambientFbx.animations[0]),
+              bodyMeshRef.current
+            );
+            ambientAction.setLoop(THREE.LoopOnce, 1);
+            ambientAction.clampWhenFinished = true;
+          }
+
           if (talkingFbx1) {
             talkingAction1 = mixerRef.current.clipAction(
-              retargetClip(talkingFbx1.animations[0])
+              retargetClip(talkingFbx1.animations[0]),
+              bodyMeshRef.current
             );
             talkingAction1.setLoop(THREE.LoopRepeat, Infinity);
           }
           if (talkingFbx2) {
             talkingAction2 = mixerRef.current.clipAction(
-              retargetClip(talkingFbx2.animations[0])
+              retargetClip(talkingFbx2.animations[0]),
+              bodyMeshRef.current
             );
             talkingAction2.setLoop(THREE.LoopRepeat, Infinity);
           }
-          mixerRef.current.addEventListener("finished", (e: any) => {
-            const idle = idleActionRef.current;
-            if (!idle) return;
-            if (e.action === introAction || e.action === interruptAction) {
+          if (typingFbx) {
+                const ta = mixerRef.current.clipAction(
+                  retargetClip(typingFbx.animations[0]),
+                  bodyMeshRef.current
+                );
+            ta.setLoop(THREE.LoopOnce, 1);
+            ta.clampWhenFinished = true; // hold final pose
+                typingActionRef.current = ta;
+                // Capture final head/neck pose when typing action completes so we can freeze it
+                const onTypingFinished = (e: any) => {
+                  if (e.action === ta) {
+                    try {
+                      mixerRef.current?.removeEventListener("finished", onTypingFinished);
+                    } catch {}
+                    const head = headBoneRef.current;
+                    const neck = neckBoneRef.current;
+                    if (head) typingHeadQuatRef.current = head.quaternion.clone();
+                    if (neck) typingNeckQuatRef.current = neck.quaternion.clone();
+                    // Release the frozen typing pose after a short hold so we don't stay looking down
+                    releaseTypingPose(1400);
+                  }
+                };
+                mixerRef.current.addEventListener("finished", onTypingFinished);
+          }
+
+          // Build a playlist for occasional one-shot idles (exclude the base idle)
+          const playlist: THREE.AnimationAction[] = [];
+          if (interruptAction) playlist.push(interruptAction);
+          if (ambientAction) playlist.push(ambientAction);
+          loopActionsRef.current = playlist;
+          // Disable auto-looping of playlist to prevent unexpected interrupts
+          loopEnabledRef.current = false;
+
+          const playNextLoopAction = () => {
+            if (!loopEnabledRef.current || playlist.length === 0) return;
+            if (animationStateRef.current === "talking") return;
+            const prev = currentLoopActionRef.current;
+            if (prev?.isRunning()) prev.fadeOut(0.4);
+            currentLoopIndexRef.current =
+              (currentLoopIndexRef.current + 1) % playlist.length;
+            const next = playlist[currentLoopIndexRef.current];
+            if (next) {
+              next.reset().setEffectiveWeight(1).fadeIn(0.4).play();
+              currentLoopActionRef.current = next;
               animationStateRef.current = "idle";
-              e.action.fadeOut(0.5);
-              idle.reset().setEffectiveWeight(1).fadeIn(0.5).play();
-              if (e.action === interruptAction) setNextInterrupt();
             }
+          };
+
+          // Do not auto-start playlist; base idle is already playing
+
+          mixerRef.current.addEventListener("finished", (e: any) => {
+            const finished = e.action as THREE.AnimationAction;
+            if (finished === introAction) {
+              playNextLoopAction();
+              return;
+            }
+            // Do not auto-advance playlist; remain on base idle unless explicitly triggered
+            return;
           });
         })
         .catch((error) => console.error("Error loading assets:", error));
 
       let animationFrameId: number;
+      const isFiniteVec3 = (v: THREE.Vector3) =>
+        Number.isFinite(v.x) && Number.isFinite(v.y) && Number.isFinite(v.z);
+      const isFiniteQuat = (q: THREE.Quaternion) =>
+        Number.isFinite(q.x) && Number.isFinite(q.y) && Number.isFinite(q.z) && Number.isFinite(q.w) && q.lengthSq() > 0;
       const animate = () => {
         if (cameraRef.current) {
           const pos = cameraRef.current.position;
-          setCameraPosition({x: Number(pos.x.toFixed(2)), y: Number(pos.y.toFixed(2)), z: Number(pos.z.toFixed(2))});
+          if (!isFiniteVec3(pos)) {
+            console.warn("ThreeCanvas: camera position non-finite; resetting", pos);
+            cameraRef.current.position.copy(lastGoodCameraPosRef.current);
+          } else {
+            lastGoodCameraPosRef.current.copy(pos);
+          }
+          const quat = cameraRef.current.quaternion;
+          if (!isFiniteQuat(quat)) {
+            console.warn("ThreeCanvas: camera quaternion non-finite; resetting", quat);
+            cameraRef.current.quaternion.copy(lastGoodCameraQuatRef.current);
+          } else {
+            lastGoodCameraQuatRef.current.copy(quat);
+          }
+          setCameraPosition({
+            x: Number(cameraRef.current.position.x.toFixed(2)),
+            y: Number(cameraRef.current.position.y.toFixed(2)),
+            z: Number(cameraRef.current.position.z.toFixed(2)),
+          });
         }
-        // ...existing animation code...
         animationFrameId = requestAnimationFrame(animate);
         const delta = clock.getDelta();
         const elapsedTime = clock.getElapsedTime();
         if (mixerRef.current) mixerRef.current.update(delta);
         controls.update();
-
-        // Camera follow while BVH is playing
         if (
           isFollowingRef.current &&
           followAnchorRef.current &&
@@ -1050,7 +1741,7 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
           followAnchorRef.current.getWorldQuaternion(q);
           const right = new THREE.Vector3(1, 0, 0).applyQuaternion(q);
           const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(q);
-          const { distance, height, side } = followViewRef.current;
+          const { distance, side } = followViewRef.current;
 
           // Horizontal-only offset (zero Y) so camera doesn't follow vertical motion
           const horizontalOffset = new THREE.Vector3()
@@ -1059,21 +1750,139 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
           horizontalOffset.y = 0;
 
           // Preserve camera Y (do not move vertically)
-          const camY = cameraRef.current.position.y;
+          let camY = cameraRef.current.position.y;
+          if (!Number.isFinite(camY)) camY = lastGoodCameraPosRef.current.y;
 
           // New camera position: anchor X/Z + horizontal offset, keep original camera Y
           const targetPos = new THREE.Vector3(anchorPos.x, camY, anchorPos.z).add(horizontalOffset);
-          cameraRef.current.position.copy(targetPos);
+          if (isFiniteVec3(targetPos)) {
+            cameraRef.current.position.copy(targetPos);
+          }
 
           // Update controls target X/Z to follow anchor, but keep target Y unchanged to avoid tilting
           const currentTarget = controlsRef.current.target;
-          controlsRef.current.target.set(anchorPos.x, currentTarget.y, anchorPos.z);
+          const newTarget = new THREE.Vector3(anchorPos.x, currentTarget.y, anchorPos.z);
+          if (isFiniteVec3(newTarget)) {
+            controlsRef.current.target.copy(newTarget);
+          }
           controlsRef.current.update();
         }
 
-        const faceMesh = faceMeshRef.current;
-        const idle = idleActionRef.current;
-        const isCurrentlyTalking = !!(faceMesh?.userData?.visemes?.length > 0);
+  const faceMesh = faceMeshRef.current;
+  const idle = idleActionRef.current;
+  const isCurrentlyTalking = !!(faceMesh?.userData?.visemes?.length > 0);
+
+        // Subtle neck/head motion only during interruptAnimation play
+    if (currentLoopActionRef.current && currentLoopActionRef.current.isRunning()) {
+          // Determine if the current loop action is the interrupt action
+          const isInterruptPlaying = ((): boolean => {
+            // interruptAction is closed over from asset load scope
+            return currentLoopActionRef.current === interruptAction;
+          })();
+          if (isInterruptPlaying && !isCurrentlyTalking) {
+            const t = elapsedTime;
+            const neck = neckBoneRef.current;
+            const head = headBoneRef.current;
+            if (neck) {
+      // Additive, small tilt/yaw on top of current animated pose
+      const neckTilt = 0.05 * Math.sin(t * 1.4);
+      const neckYaw = 0.04 * Math.sin(t * 0.9 + 1.0);
+              const q = new THREE.Quaternion().setFromEuler(
+                new THREE.Euler(0, neckYaw, neckTilt, "XYZ")
+              );
+              neck.quaternion.multiply(q);
+            }
+            if (head) {
+      const headPitch = 0.06 * Math.sin(t * 1.8 + 0.6);
+      const headYaw = 0.04 * Math.sin(t * 1.1 + 0.2);
+              const qh = new THREE.Quaternion().setFromEuler(
+                new THREE.Euler(headPitch, headYaw, 0, "XYZ")
+              );
+              head.quaternion.multiply(qh);
+            }
+          }
+        }
+
+        // Procedural idle micro-motions (breathing, weight shift, shoulders)
+        // Only when in idle state, not talking, and not following BVH
+        if (
+          animationStateRef.current === "idle" &&
+          !isCurrentlyTalking &&
+          !isFollowingRef.current &&
+          !typingActiveRef.current
+        ) {
+          const t = elapsedTime;
+          // Breathing: gentle forward/back on spine chain
+          const breath = 0.03 * Math.sin(t * 0.7 + motionPhase.breath); // amplitude, freq
+          const breathUpper = 0.02 * Math.sin(t * 0.9 + motionPhase.breath + 0.5);
+          if (spineRef.current) {
+            const q = new THREE.Quaternion().setFromEuler(
+              new THREE.Euler(breath, 0, 0, "XYZ")
+            );
+            spineRef.current.quaternion.multiply(q);
+          }
+          if (spine1Ref.current) {
+            const q1 = new THREE.Quaternion().setFromEuler(
+              new THREE.Euler(breathUpper, 0, 0, "XYZ")
+            );
+            spine1Ref.current.quaternion.multiply(q1);
+          }
+          if (spine2Ref.current) {
+            const q2 = new THREE.Quaternion().setFromEuler(
+              new THREE.Euler(breathUpper * 0.7, 0, 0, "XYZ")
+            );
+            spine2Ref.current.quaternion.multiply(q2);
+          }
+
+          // Weight shift: tiny hips roll/yaw sway
+          if (hipsBoneRef.current) {
+            const swayRoll = 0.02 * Math.sin(t * 0.5 + motionPhase.sway);
+            const swayYaw = 0.015 * Math.sin(t * 0.4 + motionPhase.sway + 1.3);
+            const qh = new THREE.Quaternion().setFromEuler(
+              new THREE.Euler(0, swayYaw, swayRoll, "XYZ")
+            );
+            hipsBoneRef.current.quaternion.multiply(qh);
+          }
+
+          // Shoulder micro-motions alternating
+          const shAmp = 0.02;
+          const shL = shAmp * Math.sin(t * 0.8 + motionPhase.shoulder);
+          const shR = shAmp * Math.sin(t * 0.8 + motionPhase.shoulder + Math.PI);
+          if (leftShoulderRef.current) {
+            const qls = new THREE.Quaternion().setFromEuler(
+              new THREE.Euler(0, 0, shL, "XYZ")
+            );
+            leftShoulderRef.current.quaternion.multiply(qls);
+          }
+          if (rightShoulderRef.current) {
+            const qrs = new THREE.Quaternion().setFromEuler(
+              new THREE.Euler(0, 0, -shR, "XYZ")
+            );
+            rightShoulderRef.current.quaternion.multiply(qrs);
+          }
+
+          // Tiny head drift for general idle (less than interrupt)
+          if (headBoneRef.current) {
+            const hdPitch = 0.015 * Math.sin(t * 0.6 + motionPhase.head);
+            const hdYaw = 0.012 * Math.sin(t * 0.7 + motionPhase.head + 0.4);
+            const qh = new THREE.Quaternion().setFromEuler(
+              new THREE.Euler(hdPitch, hdYaw, 0, "XYZ")
+            );
+            headBoneRef.current.quaternion.multiply(qh);
+          }
+        }
+
+        // If typing pose is active and we captured final quaternions, enforce them to freeze the look-down pose
+        if (typingActiveRef.current) {
+          const head = headBoneRef.current;
+          const neck = neckBoneRef.current;
+          if (head && typingHeadQuatRef.current) {
+            head.quaternion.copy(typingHeadQuatRef.current);
+          }
+          if (neck && typingNeckQuatRef.current) {
+            neck.quaternion.copy(typingNeckQuatRef.current);
+          }
+        }
 
         // Animation State Machine
         if (
@@ -1081,26 +1890,22 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
           animationStateRef.current !== "talking" &&
           !isWaitingAfterTalkRef.current
         ) {
-          const previousState = animationStateRef.current; // Store the state BEFORE changing it.
-          animationStateRef.current = "talking"; // Now change the state.
+          const previousState = animationStateRef.current;
+          animationStateRef.current = "talking";
 
-          const talkingActions = [talkingAction1, talkingAction2].filter(
-            (a) => a
-          );
-          if (talkingActions.length > 0) {
-            // Check the PREVIOUS state to decide which animation to fade out.
-            if (previousState === "interrupt" && interruptAction?.isRunning()) {
+          // Prefer talkingAction2 (newer/desired) and fall back to talkingAction1
+          const preferred = talkingAction2 || talkingAction1;
+          if (preferred) {
+            // Fade out whatever loop action is playing
+            if (currentLoopActionRef.current?.isRunning()) {
+              currentLoopActionRef.current.fadeOut(0.5);
+            } else if (previousState === "interrupt" && interruptAction?.isRunning()) {
               interruptAction.fadeOut(0.5);
             } else if (previousState === "idle" && idle?.isRunning()) {
               idle.fadeOut(0.5);
             }
-
-            const nextAction =
-              talkingActions[Math.floor(Math.random() * talkingActions.length)];
-            if (nextAction) {
-              nextAction.reset().setEffectiveWeight(1).fadeIn(0.5).play();
-              currentlyPlayingTalkingActionRef.current = nextAction;
-            }
+            preferred.reset().setEffectiveWeight(1).fadeIn(0.5).play();
+            currentlyPlayingTalkingActionRef.current = preferred;
           }
         } else if (
           animationStateRef.current === "talking" &&
@@ -1108,21 +1913,40 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
         ) {
           animationStateRef.current = "idle";
           const currentTalkingAction = currentlyPlayingTalkingActionRef.current;
-          if (currentTalkingAction?.isRunning())
-            currentTalkingAction.fadeOut(0.5);
-          if (idle) idle.reset().setEffectiveWeight(1).fadeIn(0.5).play();
+          if (currentTalkingAction?.isRunning()) currentTalkingAction.fadeOut(0.5);
           currentlyPlayingTalkingActionRef.current = null;
-        }
-
-        // Interrupt Logic
-        if (animationStateRef.current === "idle" && interruptAction) {
-          timeToNextInterrupt -= delta;
-          if (timeToNextInterrupt <= 0) {
-            animationStateRef.current = "interrupt";
-            if (idle?.isRunning()) idle.fadeOut(0.5);
-            interruptAction.reset().setEffectiveWeight(1).fadeIn(0.5).play();
+          // Resume loop cycle
+          if (typingActiveRef.current) {
+            // If typing, do nothing – typing pose controls the state
+          } else if (loopEnabledRef.current) {
+            // Trigger next in playlist immediately
+            const playlist = loopActionsRef.current;
+            if (playlist.length > 0) {
+              const prev = currentLoopActionRef.current;
+              if (prev?.isRunning()) prev.fadeOut(0.3);
+              currentLoopIndexRef.current =
+                (currentLoopIndexRef.current + 1) % playlist.length;
+              const next = playlist[currentLoopIndexRef.current];
+              next.reset().setEffectiveWeight(1).fadeIn(0.4).play();
+              currentLoopActionRef.current = next;
+            } else if (idle) {
+              idle.reset().setEffectiveWeight(1).fadeIn(0.4).play();
+            }
+          } else if (idle) {
+            idle.reset().setEffectiveWeight(1).fadeIn(0.4).play();
           }
         }
+
+  // Interrupt Logic is handled by the idle-cycle playlist when enabled.
+  // Keeping this block disabled to avoid conflicts.
+  // if (!loopEnabledRef.current && animationStateRef.current === "idle" && interruptAction) {
+  //   timeToNextInterrupt -= delta;
+  //   if (timeToNextInterrupt <= 0) {
+  //     animationStateRef.current = "interrupt";
+  //     if (idle?.isRunning()) idle.fadeOut(0.5);
+  //     interruptAction.reset().setEffectiveWeight(1).fadeIn(0.5).play();
+  //   }
+  // }
 
         // Blinking Logic
         if (faceMesh?.morphTargetDictionary && faceMesh.morphTargetInfluences) {
@@ -1186,8 +2010,21 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
 
         // Lip Sync Data Update
         if (isCurrentlyTalking && faceMesh) {
-          const audioElapsedTime =
-            (performance.now() - faceMesh.userData.audioStartTime) / 1000;
+          // Determine elapsed audio time in seconds. If playAudio stored a context time (seconds), use the
+          // AudioContext.currentTime reference; otherwise fall back to performance.now().
+          let audioElapsedTime = 0;
+          const storedStart = faceMesh.userData.audioStartTime;
+          if (typeof storedStart === 'number') {
+            const audioCtx = audioContextRef.current;
+            if (audioCtx && typeof audioCtx.currentTime === 'number') {
+              audioElapsedTime = audioCtx.currentTime - storedStart;
+            } else {
+              // Fallback to performance
+              audioElapsedTime = performance.now() / 1000 - storedStart;
+            }
+          } else {
+            audioElapsedTime = 0;
+          }
           let nextViseme = null;
           while (
             currentVisemeIndexRef.current < faceMesh.userData.visemes.length &&
@@ -1269,13 +2106,21 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
           });
         }
 
-        renderer.render(scene, camera);
+        // Only render when camera is valid; attempt recovery if not
+        if (camera && isFiniteVec3(camera.position) && isFiniteQuat(camera.quaternion)) {
+          renderer.render(scene, camera);
+        } else if (camera) {
+          camera.position.copy(lastGoodCameraPosRef.current);
+          camera.quaternion.copy(lastGoodCameraQuatRef.current);
+        }
       };
 
       const handleResize = () => {
         const currentMount = mountRef.current;
         if (!currentMount) return;
-        camera.aspect = currentMount.clientWidth / currentMount.clientHeight;
+        camera.aspect = currentMount.clientHeight
+          ? currentMount.clientWidth / currentMount.clientHeight
+          : 1;
         camera.updateProjectionMatrix();
         renderer.setSize(currentMount.clientWidth, currentMount.clientHeight);
       };
@@ -1297,6 +2142,7 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
       idleAnimationUrl,
       introAnimationUrl,
       interruptAnimationUrl,
+      animationUrl,
       talkingAnimationUrl1,
       talkingAnimationUrl2,
       backgroundData,

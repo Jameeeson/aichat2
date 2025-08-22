@@ -12,46 +12,49 @@ type VisemeMapEntry = { viseme: string; jaw: number };
 
 const rhubarbToVisemeMap: Record<RhubarbVisemeKey, VisemeMapEntry> = {
   'X': { viseme: 'viseme_sil', jaw: 0 },
-  'A': { viseme: 'viseme_aa', jaw: 0.5 }, // Open jaw for "ah"
-  'B': { viseme: 'viseme_PP', jaw: 0 },   // Closed for "b, p, m"
-  'C': { viseme: 'viseme_E',  jaw: 0.2 }, // Slightly open for "ee, i"
-  'D': { viseme: 'viseme_DD', jaw: 0.2 },
+  'A': { viseme: 'viseme_aa', jaw: 0.4 }, // Open jaw for "ah"
+  'B': { viseme: 'viseme_PP', jaw: 0.2 },   // Closed for "b, p, m"
+  'C': { viseme: 'viseme_E',  jaw: 0.4 }, // Slightly open for "ee, i"
+  'D': { viseme: 'viseme_DD', jaw: 0.02 },
   'E': { viseme: 'viseme_E',  jaw: 0.3 }, // Open for "eh"
-  'F': { viseme: 'viseme_FF', jaw: 0.2 },
-  'G': { viseme: 'viseme_kk', jaw: 0.2 },
-  'H': { viseme: 'viseme_O',  jaw: 0.4 }, // Very open for "oh"
+  'F': { viseme: 'viseme_FF', jaw: 0.1 },
+  'G': { viseme: 'viseme_kk', jaw: 0.1 },
+  'H': { viseme: 'viseme_O',  jaw: 0.3 }, // Very open for "oh"
 };
 
-const BACKEND_URL = "http://43.203.230.137:5001";
+const BACKEND_URL = "http://43.203.245.169:5001";
 
 const characters = {
   harry: {
     name: 'Harry (The Potter)',
     modelUrl: '/models/Harry.glb',
-    introAnimationUrl: "/idleanimations/harryuniqueidle.fbx",
-    idleAnimationUrl: "/idleanimations/Stretching.fbx",
+    introAnimationUrl: "/idleanimations/StandIdle.fbx",
+    idleAnimationUrl: "/idleanimations/InterruptIdle.fbx",
     interruptAnimationUrl: "/idleanimations/StandIdle.fbx",
-    animationUrl: '/idleanimations/LookingAround.fbx',
+  animationUrl: '/idleanimations/StandIdle.fbx',
+  typingAnimationUrl: '/idleanimations/waiting.fbx',
     talkingAnimationUrl1: '/talkinganimations/Talking2.fbx',
     talkingAnimationUrl2: '/talkinganimations/Talking2.fbx',
   },  
-  Joy: {
-    name: 'Joy (Dishwashing Expert)',
+  Teacher: {
+    name: 'Teacher',
     modelUrl: '/models/Joy.glb',
-    introAnimationUrl: "/idleanimations/Joyuniqueidle.fbx", 
+    introAnimationUrl: "/idleanimations/StandIdle.fbx", 
     idleAnimationUrl: "/idleanimations/StandIdle.fbx",
     interruptAnimationUrl: "/idleanimations/InterruptIdle.fbx",
     animationUrl: '/idleanimations/Stretching.fbx',
+   typingAnimationUrl: '/idleanimations/waiting.fbx',
     talkingAnimationUrl1: '/talkinganimations/Talking2.fbx',
     talkingAnimationUrl2: '/talkinganimations/Talking2.fbx',
   },
-  Surf: {
-    name: 'Surf (Fabcon Expert)',
+  Dancer: {
+    name: 'Dancer',
     modelUrl: '/models/Surf.glb',
-    introAnimationUrl: "/idleanimations/Surfuniqueidle.fbx",
+    introAnimationUrl: "/idleanimations/StandIdle.fbx",
     idleAnimationUrl: "/idleanimations/StandIdle.fbx",
     interruptAnimationUrl: "/idleanimations/Stretching.fbx",
-    animationUrl: '/idleanimations/Stretching.fbx',
+  animationUrl: '/idleanimations/Stretching.fbx',
+  typingAnimationUrl: '/idleanimations/waiting.fbx',
     talkingAnimationUrl1: '/talkinganimations/Talking2.fbx',
     talkingAnimationUrl2: '/talkinganimations/Talking2.fbx',
   },
@@ -69,7 +72,7 @@ type RawVisemeCue = { start: number; end: number; value: RhubarbVisemeKey };
 
 
 export default function Home() {
-  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [selectedCharKey, setSelectedCharKey] = useState<CharacterKey>('harry');
   const [selectedBgKey, setSelectedBgKey] = useState<BackgroundKey>('studio');
   const [chatInput, setChatInput] = useState('');
@@ -77,8 +80,10 @@ export default function Home() {
   const [messages, setMessages] = useState<Array<{role: 'user' | 'assistant'; text: string}>>([]);
   const [isSending, setIsSending] = useState(false);
   const [isTestingLipSync, setIsTestingLipSync] = useState(false);
-  const [isTestingBVH, setIsTestingBVH] = useState(false);
-  const canvasRef = useRef<ThreeCanvasHandles>(null);
+    const [isTestingBVH, setIsTestingBVH] = useState(false);
+    const canvasRef = useRef<ThreeCanvasHandles>(null);
+  const typingTimerRef = useRef<number | null>(null);
+  const hadContentRef = useRef<boolean>(false);
 
   const selectedCharacter = characters[selectedCharKey];
   const selectedBackground = backgrounds[selectedBgKey];
@@ -89,6 +94,19 @@ export default function Home() {
     if (isSending || !chatInput.trim()) return;
 
   setIsSending(true);
+  // Immediately clear typing pose/state so subsequent gestures/BVH start from neutral
+  try {
+    if (typingTimerRef.current) {
+      window.clearTimeout(typingTimerRef.current);
+      typingTimerRef.current = null;
+    }
+    hadContentRef.current = false;
+    canvasRef.current?.setTyping(false);
+    // Also call the robust reset to idle to ensure skeleton, transforms and actions are cleared
+    canvasRef.current?.resetToIdle?.();
+  } catch (e) {
+    console.warn('Failed to clear typing state on submit', e);
+  }
   const userText = chatInput;
   // append user message to history immediately
   setMessages(prev => [...prev, { role: 'user', text: userText }]);
@@ -118,6 +136,7 @@ export default function Home() {
         visemes: rawVisemeCues,
         bvh_files: bvhFileNames,
         emotion,
+        mixamo_animation,
       } = result;
 
       if (!answer) {
@@ -125,7 +144,9 @@ export default function Home() {
       }
       
   // append assistant message to history
-  setMessages(prev => [...prev, { role: 'assistant', text: answer }]);
+  // strip any bracketed tags from the visible message (tags still used for animation control)
+  const visible = String(answer).replace(/\[[^\]]*\]/g, '').replace(/\s+/g, ' ').trim();
+  setMessages(prev => [...prev, { role: 'assistant', text: visible }]);
 
       // Prepare optional assets
       let processedVisemes: Array<{ time: number; value: string; jaw: number }> | null = null;
@@ -146,15 +167,32 @@ export default function Home() {
         ? bvhFileNames.map((fileName: string) => `${BACKEND_URL}/generated_bvh/${fileName}`)
         : [];
 
+  // mixamo_animation handling removed — gestures are no longer supported
+
       // NEW ORDER: Speak first, then do the motion
       if (canvasRef.current) {
         // 1) Speech (if available)
         if (audioDataUri && processedVisemes) {
-          await canvasRef.current.playAudioWithEmotionAndLipSync(
+          // Play speech and gestures in parallel (gestures overlay on top of talking)
+          const speech = canvasRef.current.playAudioWithEmotionAndLipSync(
             audioDataUri,
             processedVisemes,
             emotion || 'neutral'
           );
+
+          if (mixamo_animation && canvasRef.current.playGestures) {
+            try {
+              const urls = Array.isArray(mixamo_animation) ? mixamo_animation : [mixamo_animation];
+              const converted = urls.map((p: string) => (p.startsWith('/') ? p : `/gesturesanimation/${p}`));
+              console.log('page.tsx: playing gestures', converted);
+              // fire-and-forget so gestures overlay while speaking
+              canvasRef.current.playGestures(converted).catch((e) => console.warn(e));
+            } catch (e) {
+              console.warn('Failed to start gestures', e);
+            }
+          }
+
+          await speech;
         }
         // 2) Motion (if available)
         if (bvhUrls.length > 0) {
@@ -291,6 +329,8 @@ canvasRef.current.playAudioWithEmotionAndLipSync(audioDataUri, visemes, 'neutral
           introAnimationUrl={selectedCharacter.introAnimationUrl}
           idleAnimationUrl={selectedCharacter.idleAnimationUrl}
           interruptAnimationUrl={selectedCharacter.interruptAnimationUrl}
+          animationUrl={selectedCharacter.animationUrl}
+          typingAnimationUrl={(selectedCharacter as any).typingAnimationUrl}
           talkingAnimationUrl1={selectedCharacter.talkingAnimationUrl1}
           talkingAnimationUrl2={selectedCharacter.talkingAnimationUrl2}
 
@@ -326,7 +366,27 @@ canvasRef.current.playAudioWithEmotionAndLipSync(audioDataUri, visemes, 'neutral
             type="text"
     placeholder="Write a message..."
             value={chatInput}
-            onChange={e => setChatInput(e.target.value)}
+            onChange={e => {
+              const v = e.target.value;
+              setChatInput(v);
+              // Transition: empty -> non-empty triggers typing pose once
+              if (v.length > 0) {
+                if (!hadContentRef.current) {
+                  canvasRef.current?.setTyping(true);
+                  hadContentRef.current = true;
+                }
+                // inactivity timer to drop back to idle after pause
+                if (typingTimerRef.current) window.clearTimeout(typingTimerRef.current);
+                typingTimerRef.current = window.setTimeout(() => {
+                  canvasRef.current?.setTyping(false);
+                }, 600);
+              } else {
+                // Cleared textbox: immediately return to idle and reset state
+                if (typingTimerRef.current) window.clearTimeout(typingTimerRef.current);
+                canvasRef.current?.setTyping(false);
+                hadContentRef.current = false;
+              }
+            }}
             disabled={isSending}
       suppressHydrationWarning
       autoComplete="off"
