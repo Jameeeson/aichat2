@@ -13,7 +13,7 @@ const sanitizeResponse = (text: string | null | undefined) => {
   return String(text).replace(/\[[^\]]*\]/g, "").replace(/\s+/g, " ").trim();
 };
 
-const BACKEND_URL = "http://43.203.245.169:5001";
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL;
 
 // Character and background definitions
 const characters = {
@@ -190,7 +190,7 @@ export default function CharacterController() {
     try {
       // 1. Fetch the BVH file names from the backend.
       const { bvhPlayer } = await import("./BVHAnimationPlayer");
-      const generatedFiles = await bvhPlayer.generateBVHAnimations(BACKEND_URL, [motionPrompt]);
+      const generatedFiles = await bvhPlayer.generateBVHAnimations(BACKEND_URL ?? "", [motionPrompt]);
       
       if (!generatedFiles || generatedFiles.length === 0) {
         throw new Error("Backend did not return any BVH files.");

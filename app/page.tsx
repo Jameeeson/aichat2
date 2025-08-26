@@ -22,39 +22,56 @@ const rhubarbToVisemeMap: Record<RhubarbVisemeKey, VisemeMapEntry> = {
   'H': { viseme: 'viseme_O',  jaw: 0.3 }, // Very open for "oh"
 };
 
-const BACKEND_URL = "http://43.203.245.169:5001";
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL;
 
-const characters = {
+// Add gender to each character so we can pick the correct idle-pack dynamically.
+type Gender = 'male' | 'female';
+
+const characters: Record<string, {
+  name: string;
+  modelUrl: string;
+  idleAnimationUrl?: string; // kept only as a fallback if needed
+  typingAnimationUrl?: string;
+  talkingAnimationUrl1?: string;
+  talkingAnimationUrl2?: string;
+  gender?: Gender;
+}> = {
   harry: {
     name: 'Harry (The Potter)',
     modelUrl: '/models/Harry.glb',
-    introAnimationUrl: "/idleanimations/StandIdle.fbx",
-    idleAnimationUrl: "/idleanimations/InterruptIdle.fbx",
-    interruptAnimationUrl: "/idleanimations/StandIdle.fbx",
-  animationUrl: '/idleanimations/StandIdle.fbx',
-  typingAnimationUrl: '/idleanimations/waiting.fbx',
+    typingAnimationUrl: '/idleanimations/waiting.fbx',
     talkingAnimationUrl1: '/talkinganimations/Talking2.fbx',
     talkingAnimationUrl2: '/talkinganimations/Talking2.fbx',
-  },  
+    gender: 'male',
+  },
   Teacher: {
     name: 'Teacher',
     modelUrl: '/models/Joy.glb',
-    introAnimationUrl: "/idleanimations/StandIdle.fbx", 
-    idleAnimationUrl: "/idleanimations/StandIdle.fbx",
-    interruptAnimationUrl: "/idleanimations/InterruptIdle.fbx",
-    animationUrl: '/idleanimations/Stretching.fbx',
-   typingAnimationUrl: '/idleanimations/waiting.fbx',
+    typingAnimationUrl: '/idleanimations/waiting.fbx',
     talkingAnimationUrl1: '/talkinganimations/Talking2.fbx',
     talkingAnimationUrl2: '/talkinganimations/Talking2.fbx',
+    gender: 'female',
   },
   Dancer: {
     name: 'Dancer',
     modelUrl: '/models/Surf.glb',
-    introAnimationUrl: "/idleanimations/StandIdle.fbx",
-    idleAnimationUrl: "/idleanimations/StandIdle.fbx",
-    interruptAnimationUrl: "/idleanimations/Stretching.fbx",
-  animationUrl: '/idleanimations/Stretching.fbx',
-  typingAnimationUrl: '/idleanimations/waiting.fbx',
+    typingAnimationUrl: '/idleanimations/waiting.fbx',
+    talkingAnimationUrl1: '/talkinganimations/Talking2.fbx',
+    talkingAnimationUrl2: '/talkinganimations/Talking2.fbx',
+    gender: 'female',
+  },
+  Police: {
+    name: 'Police',
+    modelUrl: '/models/policev2.glb',
+    typingAnimationUrl: '/idleanimations/waiting.fbx',
+    talkingAnimationUrl1: '/talkinganimations/Talking2.fbx',
+    talkingAnimationUrl2: '/talkinganimations/Talking2.fbx',
+    gender: 'male',
+  },
+  chef: {
+    name: 'chef',
+    modelUrl: '/models/chef.glb',
+    typingAnimationUrl: '/idleanimations/waiting.fbx',
     talkingAnimationUrl1: '/talkinganimations/Talking2.fbx',
     talkingAnimationUrl2: '/talkinganimations/Talking2.fbx',
   },
@@ -85,8 +102,58 @@ export default function Home() {
   const typingTimerRef = useRef<number | null>(null);
   const hadContentRef = useRef<boolean>(false);
 
+  // Determine which idle animation to use based on the character's gender.
+  // Female characters use the female idle pack, male characters use the male idle pack.
+  // Return an array of idle FBX files for the given gender so ThreeCanvas can
+  // sequence them one-by-one. Order is the playback sequence.
+  const getGenderedIdle = (gender?: Gender): string[] => {
+    if (gender === 'female') {
+      return [
+        '/idleanimations/female/F_Standing_Idle_001.fbx',
+        '/idleanimations/female/F_Standing_Idle_Variations_001.fbx',
+        '/idleanimations/female/F_Standing_Idle_Variations_002.fbx',
+        '/idleanimations/female/F_Standing_Idle_Variations_003.fbx',
+        '/idleanimations/female/F_Standing_Idle_Variations_004.fbx',
+        '/idleanimations/female/F_Standing_Idle_Variations_005.fbx',
+        '/idleanimations/female/F_Standing_Idle_Variations_006.fbx',
+        '/idleanimations/female/F_Standing_Idle_Variations_007.fbx',
+        '/idleanimations/female/F_Standing_Idle_Variations_008.fbx',
+        '/idleanimations/female/F_Standing_Idle_Variations_009.fbx',
+      ];
+    }
+    // male
+    return [
+      '/idleanimations/male/M_Standing_Idle_001.fbx',
+      '/idleanimations/male/M_Standing_Idle_002.fbx',
+      '/idleanimations/male/M_Standing_Idle_Variations_001.fbx',
+      '/idleanimations/male/M_Standing_Idle_Variations_002.fbx',
+      '/idleanimations/male/M_Standing_Idle_Variations_003.fbx',
+      '/idleanimations/male/M_Standing_Idle_Variations_004.fbx',
+      '/idleanimations/male/M_Standing_Idle_Variations_005.fbx',
+      '/idleanimations/male/M_Standing_Idle_Variations_006.fbx',
+      '/idleanimations/male/M_Standing_Idle_Variations_007.fbx',
+      '/idleanimations/male/M_Standing_Idle_Variations_008.fbx',
+      '/idleanimations/male/M_Standing_Idle_Variations_009.fbx',
+      '/idleanimations/male/M_Standing_Idle_Variations_010.fbx',
+    ];
+  };
+
+  // Choose effective idle animation for the selected character (gender-aware with fallback)
   const selectedCharacter = characters[selectedCharKey];
+  // Pass an array to ThreeCanvas when available; fall back to a single-file array
+  const effectiveIdleAnimationUrl: string | string[] = selectedCharacter?.gender
+    ? getGenderedIdle(selectedCharacter.gender)
+    : selectedCharacter?.idleAnimationUrl
+    ? [selectedCharacter.idleAnimationUrl]
+    : ['/idleanimations/StandIdle.fbx'];
+
   const selectedBackground = backgrounds[selectedBgKey];
+
+  // Debug: show which idle animation file we're asking ThreeCanvas to load
+  // (Check browser console / network to ensure file exists and loads)
+  if (typeof window !== 'undefined') {
+    console.log('Selected character:', selectedCharKey, 'gender:', selectedCharacter?.gender, 'idle:', Array.isArray(effectiveIdleAnimationUrl) ? effectiveIdleAnimationUrl.join(', ') : effectiveIdleAnimationUrl);
+  }
 
   // --- CORRECTED CHAT SUBMIT HANDLER ---
   const handleChatSubmit = async (e: React.FormEvent) => {
@@ -326,14 +393,10 @@ canvasRef.current.playAudioWithEmotionAndLipSync(audioDataUri, visemes, 'neutral
         <ThreeCanvas
           ref={canvasRef}
           characterModelUrl={selectedCharacter.modelUrl}
-          introAnimationUrl={selectedCharacter.introAnimationUrl}
-          idleAnimationUrl={selectedCharacter.idleAnimationUrl}
-          interruptAnimationUrl={selectedCharacter.interruptAnimationUrl}
-          animationUrl={selectedCharacter.animationUrl}
+          idleAnimationUrl={effectiveIdleAnimationUrl}
           typingAnimationUrl={(selectedCharacter as any).typingAnimationUrl}
           talkingAnimationUrl1={selectedCharacter.talkingAnimationUrl1}
           talkingAnimationUrl2={selectedCharacter.talkingAnimationUrl2}
-
           backgroundData={selectedBackground}
         />
         {/* AI response bubble above the input, centered */}
