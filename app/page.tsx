@@ -12,14 +12,14 @@ type VisemeMapEntry = { viseme: string; jaw: number };
 
 const rhubarbToVisemeMap: Record<RhubarbVisemeKey, VisemeMapEntry> = {
   'X': { viseme: 'viseme_sil', jaw: 0 },
-  'A': { viseme: 'viseme_aa', jaw: 0.4 }, // Open jaw for "ah"
+  'A': { viseme: 'viseme_aa', jaw: 0.8 }, // Open jaw for "ah"
   'B': { viseme: 'viseme_PP', jaw: 0.2 },   // Closed for "b, p, m"
   'C': { viseme: 'viseme_E',  jaw: 0.4 }, // Slightly open for "ee, i"
   'D': { viseme: 'viseme_DD', jaw: 0.02 },
   'E': { viseme: 'viseme_E',  jaw: 0.3 }, // Open for "eh"
   'F': { viseme: 'viseme_FF', jaw: 0.1 },
   'G': { viseme: 'viseme_kk', jaw: 0.1 },
-  'H': { viseme: 'viseme_O',  jaw: 0.3 }, // Very open for "oh"
+  'H': { viseme: 'viseme_O',  jaw: 0.5 }, // Very open for "oh"
 };
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL;
@@ -36,8 +36,8 @@ const characters: Record<string, {
   talkingAnimationUrl2?: string;
   gender?: Gender;
 }> = {
-  harry: {
-    name: 'Harry (The Potter)',
+  Musician: {
+    name: 'Musician',
     modelUrl: '/models/Harry.glb',
     typingAnimationUrl: '/idleanimations/waiting.fbx',
     talkingAnimationUrl1: '/talkinganimations/Talking2.fbx',
@@ -68,9 +68,9 @@ const characters: Record<string, {
     talkingAnimationUrl2: '/talkinganimations/Talking2.fbx',
     gender: 'male',
   },
-  chef: {
-    name: 'chef',
-    modelUrl: '/models/chef.glb',
+  Instructor: {
+    name: 'Instructor',
+    modelUrl: '/models/instructor.glb',
     typingAnimationUrl: '/idleanimations/waiting.fbx',
     talkingAnimationUrl1: '/talkinganimations/Talking2.fbx',
     talkingAnimationUrl2: '/talkinganimations/Talking2.fbx',
@@ -90,7 +90,9 @@ type RawVisemeCue = { start: number; end: number; value: RhubarbVisemeKey };
 
 export default function Home() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
-  const [selectedCharKey, setSelectedCharKey] = useState<CharacterKey>('harry');
+  // Ensure the selected character key defaults to a real key from the map
+  const defaultCharKey = (Object.keys(characters)[0] || 'Musician') as CharacterKey;
+  const [selectedCharKey, setSelectedCharKey] = useState<CharacterKey>(defaultCharKey);
   const [selectedBgKey, setSelectedBgKey] = useState<BackgroundKey>('studio');
   const [chatInput, setChatInput] = useState('');
   const [chatResponse, setChatResponse] = useState('');

@@ -23,6 +23,7 @@
   inset: 0; /* full screen */
   height: 100%;
   position: relative;
+  z-index: 0; /* create stacking context so pseudo-element is behind canvas */
   /* deep blue canvas background fallback */
   background: linear-gradient(180deg, #0b3b6f 0%, #0a2a55 100%);
   overflow: hidden;
@@ -38,6 +39,16 @@
   background-position: top center;
   opacity: 0.10;
   pointer-events: none;
+  /* Ensure the wave sits behind the WebGL canvas and UI overlays */
+  z-index: 1;
+}
+
+/* Ensure the canvas is positioned above the decorative wave */
+.rightPanel > canvas,
+.rightPanel canvas {
+  position: relative;
+  z-index: 10; /* above the wave but below UI elements like chat */
+  display: block;
 }
 
 /* Hamburger menu like reference (top-left of canvas) */

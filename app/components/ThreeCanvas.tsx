@@ -419,6 +419,9 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
     const currentLoopActionRef = useRef<THREE.AnimationAction | null>(null);
     const currentLoopIndexRef = useRef<number>(-1);
     const loopEnabledRef = useRef<boolean>(false);
+    // Refs to hold talking animation actions so we can start/stop them during speech
+    const talkingAction1Ref = useRef<THREE.AnimationAction | null>(null);
+    const talkingAction2Ref = useRef<THREE.AnimationAction | null>(null);
 
     // Helper: set/lerp a morph target if present
     const setMorphLerp = (
@@ -562,6 +565,8 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
       });
       targetJawOpen.current = 0;
       currentSpeechEmotionRef.current = emotion;
+      // Ensure emotion is applied at full intensity for this speech
+      speechEmotionIntensityRef.current = 1;
 
       // Ensure AudioContext
       const AudioCtor: any = window.AudioContext || (window as any).webkitAudioContext;
@@ -593,13 +598,68 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
             setTimeout(() => {
               if (faceMesh) {
                 faceMesh.userData.visemes = [];
+                // clear the scheduled audio start so render loop relaxes visemes/jaw
+                faceMesh.userData.audioStartTime = undefined;
+                // reset viseme index
+                currentVisemeIndexRef.current = 0;
               }
+              // Stop any talking action and restore idle/loop
+              try {
+                const talkingAct = currentlyPlayingTalkingActionRef.current;
+                if (talkingAct) {
+                  talkingAct.fadeOut(0.3);
+                  currentlyPlayingTalkingActionRef.current = null;
+                }
+                const playlist = loopActionsRef.current;
+                const idleAct = idleActionRef.current;
+                if (playlist.length > 0) {
+                  const next = playlist[(currentLoopIndexRef.current + 1) % playlist.length];
+                  if (next) {
+                    next.reset().setEffectiveWeight(1).fadeIn(0.3).play();
+                    currentLoopActionRef.current = next;
+                  }
+                } else if (idleAct) {
+                  idleAct.reset().setEffectiveWeight(1).fadeIn(0.3).play();
+                }
+                animationStateRef.current = "idle";
+              } catch (e) {}
               isWaitingAfterTalkRef.current = false;
+              // gently reset emotion state so it doesn't persist into the next speech
               currentSpeechEmotionRef.current = "neutral";
+              // set intensity to 0 to allow morphs to relax to neutral
+              speechEmotionIntensityRef.current = 0;
               if (onEndedCallback) onEndedCallback();
               resolve();
             }, 2000);
           };
+
+          // If we have talking actions available, start one now so the character animates while audio plays
+          try {
+            const mixer = mixerRef.current;
+            const idleAct = idleActionRef.current;
+            const ta1 = talkingAction1Ref.current;
+            const ta2 = talkingAction2Ref.current;
+            let pick: THREE.AnimationAction | null = null;
+            if (ta1 && ta2) {
+              // simple alternate/random pick
+              pick = Math.random() < 0.5 ? ta1 : ta2;
+            } else if (ta1) pick = ta1;
+            else if (ta2) pick = ta2;
+
+            if (pick && mixer) {
+              try {
+                // fade out any loop/idle to let talking take over
+                const prevLoop = currentLoopActionRef.current;
+                if (prevLoop?.isRunning()) prevLoop.fadeOut(0.15);
+                else if (idleAct?.isRunning()) idleAct.fadeOut(0.15);
+              } catch (e) {}
+              try {
+                pick.reset().setEffectiveWeight(1).fadeIn(0.15).play();
+                currentlyPlayingTalkingActionRef.current = pick;
+                animationStateRef.current = "talking";
+              } catch (e) {}
+            }
+          } catch (e) {}
 
           // Small scheduling delay to ensure decode/time alignment
           const startTime = audioCtx.currentTime + 0.06;
@@ -1103,109 +1163,19 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
       },
       setStaticEmotion: (emotion) => {
         currentSpeechEmotionRef.current = emotion;
+        // Ensure explicit intensity when a static emotion is requested
+        speechEmotionIntensityRef.current = 1;
       },
       setTyping: (isTyping: boolean) => {
-        const mixer = mixerRef.current;
-        const idle = idleActionRef.current;
-        const typingAction = typingActionRef.current;
-        if (!mixer || !idle || !typingAction) {
-          // If typing action isn't available yet, try to load it asynchronously
-          if (!mixer || !idle) {
-            typingActiveRef.current = false;
-            return;
-          }
-          // Mark desired state and attempt to load/create the typing action
-          typingActiveRef.current = isTyping;
-          (async () => {
-            try {
-              const candidates = [
-                typingAnimationUrl,
-                "/idleanimations/waitingprompt.fbx",
-                "/idleanimations/waiting.fbx",
-              ].filter(Boolean) as string[];
-              let loaded: any = null;
-              for (const url of candidates) {
-                try {
-                  loaded = await loadFBXCached(url);
-                  console.log("ThreeCanvas: dynamically loaded typing animation:", url);
-                  break;
-                } catch (e) {
-                  console.warn("ThreeCanvas: failed to load typing candidate:", url, e);
-                }
-              }
-              if (!loaded || !loaded.animations || loaded.animations.length === 0) {
-                console.warn("ThreeCanvas: no typing animation found after dynamic load");
-                typingActiveRef.current = false;
-                return;
-              }
-              const clip = retargetClip(loaded.animations[0].clone());
-              const target = bodyMeshRef.current;
-              if (!target) {
-                console.warn("ThreeCanvas: body mesh missing, cannot bind typing action");
-                typingActiveRef.current = false;
-                return;
-              }
-              const ta = mixer.clipAction(clip, target);
-              ta.setLoop(THREE.LoopOnce, 1);
-              ta.clampWhenFinished = true;
-              typingActionRef.current = ta;
-              // If caller still wants typing, play now
-              if (typingActiveRef.current) {
-                if (currentLoopActionRef.current?.isRunning()) currentLoopActionRef.current.fadeOut(0.25);
-                else if (idle.isRunning()) idle.fadeOut(0.25);
-                ta.reset().setEffectiveWeight(1).fadeIn(0.25).play();
-              }
-              // Capture final pose when this dynamically loaded typing action finishes
-              const onDynFinished = (e: any) => {
-                if (e.action === ta) {
-                  try { mixer.removeEventListener("finished", onDynFinished); } catch {}
-                  const head = headBoneRef.current;
-                  const neck = neckBoneRef.current;
-                  if (head) typingHeadQuatRef.current = head.quaternion.clone();
-                  if (neck) typingNeckQuatRef.current = neck.quaternion.clone();
-                  // Release the frozen typing pose after a short hold so we don't stay looking down
-                  releaseTypingPose(1400);
-                }
-              };
-              mixer.addEventListener("finished", onDynFinished);
-            } catch (err) {
-              console.warn("ThreeCanvas: error loading typing animation", err);
-              typingActiveRef.current = false;
-            }
-          })();
-          return;
-        }
-        if (isTyping) {
-          // If already in typing mode, don't restart the pose
-          if (typingActiveRef.current) return;
-          typingActiveRef.current = true;
-          // Fade out any loop/idle action, then play typing pose once and hold
-          if (currentLoopActionRef.current?.isRunning()) {
-            currentLoopActionRef.current.fadeOut(0.25);
-          } else if (idle.isRunning()) {
-            idle.fadeOut(0.25);
-          }
-          typingAction.reset().setEffectiveWeight(1).fadeIn(0.25).play();
-        } else {
-          if (!typingActiveRef.current) return;
-          typingActiveRef.current = false;
-          // Clear any hold timer and frozen quats
-          clearTypingHoldTimeout();
-          typingHeadQuatRef.current = null;
-          typingNeckQuatRef.current = null;
-          // Return to loop or idle
-          const playlist = loopActionsRef.current;
-          if (playlist.length > 0) {
-            const prev = currentLoopActionRef.current;
-            if (prev?.isRunning()) prev.fadeOut(0.25);
-            currentLoopIndexRef.current = (currentLoopIndexRef.current + 1) % playlist.length;
-            const next = playlist[currentLoopIndexRef.current];
-            next.reset().setEffectiveWeight(1).fadeIn(0.25).play();
-            currentLoopActionRef.current = next;
-          } else {
-            idle.reset().setEffectiveWeight(1).fadeIn(0.25).play();
-          }
-        }
+        // Simplified typing: only track the boolean flag but do NOT change
+        // animation actions. This preserves the idle/talking loop while typing
+        // in the chat input and prevents frozen/held poses from leaking into
+        // subsequent gestures or speeches.
+        typingActiveRef.current = Boolean(isTyping);
+        // Ensure we don't keep any frozen head/neck quaternions or timers
+        clearTypingHoldTimeout();
+        typingHeadQuatRef.current = null;
+        typingNeckQuatRef.current = null;
       },
       // Reset the skeleton, stop all actions and return to the idle loop.
       resetToIdle: () => {
@@ -1389,6 +1359,10 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
         talkingAction2 = mixerRef.current.clipAction(retargetClip(talkingFbx2.animations[0]));
         talkingAction2.setLoop(THREE.LoopRepeat, Infinity);
       }
+
+      // Store talking actions on refs so other functions can start/stop them
+      talkingAction1Ref.current = talkingAction1 || null;
+      talkingAction2Ref.current = talkingAction2 || null;
 
       // If we have multiple idle actions, advance to the next when one finishes
       let idleSeqIndex = 0;
