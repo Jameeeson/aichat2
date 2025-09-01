@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useRef } from 'react';
+import { useState, useRef, useMemo } from 'react';
 import styles from './page.module.css';
 import ThreeCanvas, { type ThreeCanvasHandles } from './components/ThreeCanvas';
 
@@ -142,12 +142,12 @@ export default function Home() {
 
   // Choose effective idle animation for the selected character (gender-aware with fallback)
   const selectedCharacter = characters[selectedCharKey];
-  // Pass an array to ThreeCanvas when available; fall back to a single-file array
-  const effectiveIdleAnimationUrl: string | string[] = selectedCharacter?.gender
-    ? getGenderedIdle(selectedCharacter.gender)
-    : selectedCharacter?.idleAnimationUrl
-    ? [selectedCharacter.idleAnimationUrl]
-    : ['/idleanimations/StandIdle.fbx'];
+  // Memoize idle array so it doesn't change reference on every render (prevents canvas reload while typing)
+  const effectiveIdleAnimationUrl: string | string[] = useMemo(() => {
+    if (selectedCharacter?.gender) return getGenderedIdle(selectedCharacter.gender);
+    if (selectedCharacter?.idleAnimationUrl) return [selectedCharacter.idleAnimationUrl];
+    return ['/idleanimations/StandIdle.fbx'];
+  }, [selectedCharKey]);
 
   const selectedBackground = backgrounds[selectedBgKey];
 
@@ -171,8 +171,8 @@ export default function Home() {
     }
     hadContentRef.current = false;
     canvasRef.current?.setTyping(false);
-    // Also call the robust reset to idle to ensure skeleton, transforms and actions are cleared
-    canvasRef.current?.resetToIdle?.();
+    // Temporarily disabled resetting to idle/T-pose on submit to preserve current pose while the request is processed
+    // canvasRef.current?.resetToIdle?.();
   } catch (e) {
     console.warn('Failed to clear typing state on submit', e);
   }

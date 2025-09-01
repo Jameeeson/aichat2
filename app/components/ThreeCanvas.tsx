@@ -1254,6 +1254,7 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
       const typingFbx = assets[assetIndex++] as any;
 
       const characterModel = gltf.scene;
+      console.log('ThreeCanvas: adding character model to scene:', characterModel);
       scene.add(characterModel);
       bodyMeshRef.current =
         findBestSkinnedMesh(characterModel) ||
@@ -1267,6 +1268,26 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
       // Log bone list for debugging
       const modelBones = bodyMeshRef.current.skeleton.bones.map((bone) => bone.name);
       console.log("--- CHARACTER MODEL BONES (TARGET) ---", modelBones);
+
+      // Log detected face/skinned meshes and their morph targets for debugging
+      try {
+        const faceMeshes: { name: string; morphs: string[] }[] = [];
+        characterModel.traverse((obj: any) => {
+          if (obj?.isSkinnedMesh && obj.morphTargetDictionary) {
+            faceMeshes.push({
+              name: obj.name || '(unnamed)',
+              morphs: Object.keys(obj.morphTargetDictionary),
+            });
+          }
+        });
+        if (faceMeshes.length > 0) {
+          console.log(`ThreeCanvas: detected ${faceMeshes.length} face/skinned mesh(es) for model ${characterModelUrl}:`, faceMeshes);
+        } else {
+          console.log(`ThreeCanvas: no face/skinned meshes with morph targets found for model ${characterModelUrl}`);
+        }
+      } catch (e) {
+        console.warn('ThreeCanvas: error while enumerating face meshes', e);
+      }
 
       // Initialize mixer using the skinned mesh
       mixerRef.current = new THREE.AnimationMixer(bodyMeshRef.current);
@@ -1419,9 +1440,22 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
       });
     };
 
+    // Build stable signatures so effect doesn't rerun for equal arrays/objects
+    const idleSignature = Array.isArray(idleAnimationUrl)
+      ? idleAnimationUrl.join('|')
+      : String(idleAnimationUrl ?? '');
+    const bgSignature = backgroundData
+      ? `${backgroundData.name}|${backgroundData.url ?? ''}|${backgroundData.color ?? ''}`
+      : backgroundPreset;
+
     useEffect(() => {
-      if (!mountRef.current) return;
+      console.log('ThreeCanvas mounting with character:', characterModelUrl);
+      if (!mountRef.current) {
+        console.error('ThreeCanvas: mountRef.current is null!');
+        return;
+      }
       const currentMount = mountRef.current;
+      console.log('ThreeCanvas: mount element dimensions:', currentMount.clientWidth, 'x', currentMount.clientHeight);
   const scene = new THREE.Scene();
       const selectedBackground: BackgroundData =
         backgroundData || backgrounds[backgroundPreset] || backgrounds.studio;
@@ -1514,7 +1548,9 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
       renderer.setPixelRatio(window.devicePixelRatio);
       renderer.shadowMap.enabled = true;
   renderer.setClearColor(0x000000, 0); // fully transparent
+      console.log('ThreeCanvas: renderer created, canvas size:', renderer.domElement.width, 'x', renderer.domElement.height);
       currentMount.appendChild(renderer.domElement);
+      console.log('ThreeCanvas: renderer canvas added to mount, children count:', currentMount.children.length);
       const hemiLight = new THREE.HemisphereLight(0xffffff, 0x444444, 3);
       scene.add(hemiLight);
       const dirLight = new THREE.DirectionalLight(0xffffff, 3);
@@ -1671,12 +1707,16 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
             const promises: Promise<any>[] = [];
       
             // Character model (GLTF)
+            console.log('ThreeCanvas: loading character model:', characterModelUrl);
             promises.push(loadGLTFCached(characterModelUrl));
       
             // Idle animations (single string or array)
             const idleUrls = Array.isArray(idleAnimationUrl) ? idleAnimationUrl : [idleAnimationUrl];
                        for (const u of idleUrls) {
-              if (u) promises.push(loadFBXCached(u));
+              if (u) {
+                console.log('ThreeCanvas: loading idle animation:', u);
+                promises.push(loadFBXCached(u));
+              }
             }
       
             // Optional animations
@@ -1691,6 +1731,7 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
       
             Promise.all(promises)
               .then((assets) => {
+                console.log('ThreeCanvas: assets loaded successfully for', characterModelUrl, 'assets count:', assets.length);
                 try {
                   handleAssetsLoaded(assets, scene, camera, controls, renderer);
                 } catch (err) {
@@ -1698,12 +1739,13 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
                 }
               })
               .catch((err) => {
-                console.error("ThreeCanvas: failed to load assets:", err);
+                console.error("ThreeCanvas: failed to load assets for", characterModelUrl, "error:", err);
               });
 
       // end of effect body: cleanup and return
       // Cleanup will stop audio, remove the renderer DOM element, and invoke any idle-seq cleanup.
       return () => {
+        console.log('ThreeCanvas unmounting for character:', characterModelUrl);
         try { if (audioRef.current && audioRef.current.isPlaying) audioRef.current.stop(); } catch (e) {}
         try { if (audioSourceRef.current) { audioSourceRef.current.onended = null; audioSourceRef.current.stop?.(); audioSourceRef.current.disconnect?.(); audioSourceRef.current = null; } } catch (e) {}
         try { window.removeEventListener('resize', onResize); } catch (e) {}
@@ -1718,7 +1760,14 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
         try { (renderer as any)._idleSeqCleanup?.(); } catch (e) {}
       };
     }, [
-      // Run once on mount to avoid reloading on every keystroke/prop change.
+      characterModelUrl,
+      idleSignature,
+      introAnimationUrl,
+      interruptAnimationUrl,
+      talkingAnimationUrl1,
+      talkingAnimationUrl2,
+      typingAnimationUrl,
+      bgSignature,
     ]);
 
     // Render mount point for the WebGL canvas
