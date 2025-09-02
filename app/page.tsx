@@ -103,6 +103,8 @@ export default function Home() {
     const canvasRef = useRef<ThreeCanvasHandles>(null);
   const typingTimerRef = useRef<number | null>(null);
   const hadContentRef = useRef<boolean>(false);
+  // If backend returns a generated background image (base64), store it here as a data URL
+  const [customBackgroundUrl, setCustomBackgroundUrl] = useState<string | null>(null);
 
   // Determine which idle animation to use based on the character's gender.
   // Female characters use the female idle pack, male characters use the male idle pack.
@@ -151,6 +153,28 @@ export default function Home() {
 
   const selectedBackground = backgrounds[selectedBgKey];
 
+  // If a backend-generated background exists, prefer it; otherwise use the selected preset
+  const effectiveBackground = customBackgroundUrl
+    ? { name: 'Generated', url: customBackgroundUrl }
+    : selectedBackground;
+
+  // Compute inline style for the right panel: use generated background image when available
+  const rightPanelStyle: React.CSSProperties = {
+    // If a generated/custom background exists, use it as the panel background
+    ...(customBackgroundUrl
+      ? {
+          backgroundImage: `url(${customBackgroundUrl})`,
+          backgroundPosition: 'center',
+          backgroundSize: 'cover',
+          backgroundRepeat: 'no-repeat',
+        }
+      : {}),
+    // Always expose a CSS variable that the ::before pseudo-element can consume.
+    // The property name uses a cast to any because React's CSSProperties doesn't
+    // include custom properties in the typing.
+    ['--wave-image' as any]: customBackgroundUrl ? `url(${customBackgroundUrl})` : "url('/wave.png')",
+  };
+
   // Debug: show which idle animation file we're asking ThreeCanvas to load
   // (Check browser console / network to ensure file exists and loads)
   if (typeof window !== 'undefined') {
@@ -188,8 +212,7 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           text: prompt,
-          character: selectedCharKey,
-          background: selectedBgKey
+          character: selectedCharKey
         }),
       });
 
@@ -199,6 +222,20 @@ export default function Home() {
       
       // The backend returns the raw Rhubarb cues in the 'visemes' property
       const result = await companionResponse.json();
+      // Debug: log companion response keys and whether a background_image was returned
+      try {
+        console.log('page.tsx: companion response keys:', Object.keys(result || {}));
+        const possibleBg = result && (result.background_image || result.background_image_base64 || result.background_imageBase64);
+        if (possibleBg) {
+          const len = typeof possibleBg === 'string' ? possibleBg.length : undefined;
+          console.log('page.tsx: companion returned background image (base64), length:', len);
+        } else {
+          console.log('page.tsx: companion did NOT return a background image');
+        }
+      } catch (e) {
+        console.warn('page.tsx: failed to inspect companion response for background image', e);
+      }
+
       const {
         response: answer,
         audio_base64,
@@ -206,7 +243,13 @@ export default function Home() {
         bvh_files: bvhFileNames,
         emotion,
         mixamo_animation,
+        background_image,
+        background_image_base64,
+        background_imageBase64,
       } = result;
+
+      // Prefer any of the known background base64 keys
+      const bg64 = background_image || background_image_base64 || background_imageBase64 || null;
 
       if (!answer) {
         throw new Error("Invalid or incomplete response from companion API");
@@ -268,6 +311,35 @@ export default function Home() {
           await canvasRef.current.playAnimation(bvhUrls[0]);
         }
       }
+
+      // Handle optional background image (base64)
+      if (bg64) {
+         // Log receipt of backend-generated background image (avoid printing full base64)
+         try {
+          const len = typeof bg64 === 'string' ? bg64.length : undefined;
+          console.log('page.tsx: received background image from backend', { length: len });
+         } catch (e) {
+           console.log('page.tsx: received background_image from backend');
+         }
+         // Backend may already send a full data URL or raw base64.
+         try {
+          if (typeof bg64 === 'string' && bg64.startsWith('data:')) {
+            setCustomBackgroundUrl(bg64);
+          } else {
+            // Heuristic: JPEG base64 often starts with '/9j/'
+            const guessedMime = typeof bg64 === 'string' && bg64.slice(0,4) === '/9j/' ? 'image/jpeg' : 'image/png';
+            setCustomBackgroundUrl(`data:${guessedMime};base64,${bg64}`);
+           }
+         } catch (e) {
+           console.warn('Failed to set custom background image from backend', e);
+           // fallback: clear custom background so UI uses selected preset
+           setCustomBackgroundUrl(null);
+         }
+       } else {
+         // No background returned — clear any previous generated background so
+         // the UI falls back to the selected preset/background pack.
+         setCustomBackgroundUrl(null);
+       }
 
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : "An unknown error occurred.";
@@ -391,16 +463,18 @@ canvasRef.current.playAudioWithEmotionAndLipSync(audioDataUri, visemes, 'neutral
         </div>
       </div>
       
-  <div className={styles.rightPanel}>
-        <ThreeCanvas
-          ref={canvasRef}
-          characterModelUrl={selectedCharacter.modelUrl}
-          idleAnimationUrl={effectiveIdleAnimationUrl}
-          typingAnimationUrl={(selectedCharacter as any).typingAnimationUrl}
-          talkingAnimationUrl1={selectedCharacter.talkingAnimationUrl1}
-          talkingAnimationUrl2={selectedCharacter.talkingAnimationUrl2}
-          backgroundData={selectedBackground}
-        />
+  <div className={styles.rightPanel} style={rightPanelStyle}>
+        <div style={{ position: 'absolute', inset: '0', bottom: '0', overflow: 'hidden' }}>
+          <ThreeCanvas
+            ref={canvasRef}
+            characterModelUrl={selectedCharacter.modelUrl}
+            idleAnimationUrl={effectiveIdleAnimationUrl}
+            typingAnimationUrl={(selectedCharacter as any).typingAnimationUrl}
+            talkingAnimationUrl1={selectedCharacter.talkingAnimationUrl1}
+            talkingAnimationUrl2={selectedCharacter.talkingAnimationUrl2}
+            backgroundData={effectiveBackground}
+          />
+        </div>
         {/* AI response bubble above the input, centered */}
         {messages.length > 0 && (
           <div className={styles.messageCard}>

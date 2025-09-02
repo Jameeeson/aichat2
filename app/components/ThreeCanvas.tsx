@@ -109,6 +109,8 @@ export interface ThreeCanvasHandles {
   playAudioWithLipSync?: (audioBase64OrUrl: string, visemes: any[]) => Promise<void>;
   // Play one or more Mixamo FBX gestures (paths served from /public)
   playGestures?: (urls: string[] | string) => Promise<void>;
+  // Backwards-compatible: accept a Mixamo short-name or path and play/queue it
+  playMixamoAnimation?: (name: string | string[]) => Promise<void>;
   // Reset skeleton, stop all actions, and return to idle loop
   resetToIdle?: () => void;
 }
@@ -804,6 +806,101 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
       });
     };
 
+    // Mixamo gesture queue and helpers (added)
+const mixamoQueueRef = useRef<string[]>([]);
+const isProcessingMixamoRef = useRef(false);
+
+const processMixamoQueue = async () => {
+  if (isProcessingMixamoRef.current) return;
+  isProcessingMixamoRef.current = true;
+  try {
+    while (mixamoQueueRef.current.length > 0) {
+      const next = mixamoQueueRef.current.shift()!;
+      try {
+        // Delegate to the same playback implementation used by playGestures
+        // Reuse the public playGestures by invoking the function via the imperative handle later
+        // but we can't reference the handle here, so call the internal logic directly.
+        // We'll load the FBX and play it similarly to playGestures' loop.
+        const url = String(next);
+        console.log('ThreeCanvas: processing queued mixamo gesture:', url);
+        if (!mixerRef.current || !bodyMeshRef.current) {
+          console.warn('ThreeCanvas: mixer/model not ready while processing queue; re-queuing', url);
+          mixamoQueueRef.current.unshift(url);
+          break;
+        }
+        const loaded: any = await loadFBXCached(url);
+        if (!loaded || !loaded.animations || loaded.animations.length === 0) {
+          console.warn('ThreeCanvas: queued mixamo FBX had no animations:', url);
+          continue;
+        }
+        const clip = retargetClip(loaded.animations[0].clone());
+        // Dedupe quaternion tracks for hands
+        const seenQuat = new Set<string>();
+        const deduped: THREE.KeyframeTrack[] = [];
+        for (const track of clip.tracks) {
+          if (
+            track.name.endsWith('.quaternion') &&
+            (track.name.startsWith('LeftHand.') || track.name.startsWith('RightHand.'))
+          ) {
+            if (seenQuat.has(track.name)) continue;
+            seenQuat.add(track.name);
+          }
+          deduped.push(track);
+        }
+        clip.tracks = deduped;
+
+        const mixer = mixerRef.current as THREE.AnimationMixer;
+        const target = bodyMeshRef.current as THREE.Object3D;
+        const action = mixer.clipAction(clip as any, target as any);
+        action.setLoop(THREE.LoopOnce, 1);
+        action.clampWhenFinished = true;
+
+        // Fade out base animations
+        const prevTalking = currentlyPlayingTalkingActionRef.current;
+        const prevLoop = currentLoopActionRef.current;
+        const idle = idleActionRef.current;
+        try {
+          if (prevTalking?.isRunning()) {
+            prevTalking.fadeOut(0.15);
+          } else if (prevLoop?.isRunning()) {
+            prevLoop.fadeOut(0.15);
+          } else if (idle?.isRunning()) {
+            idle.fadeOut(0.15);
+          }
+        } catch (e) {}
+
+        action.reset().setEffectiveWeight(1).fadeIn(0.15).play();
+
+        await new Promise<void>((resolve) => {
+          const onFinished = (e: any) => {
+            if (e.action === action) {
+              try { mixer.removeEventListener('finished', onFinished); } catch {}
+              action.fadeOut(0.15);
+              try {
+                if (prevTalking) {
+                  prevTalking.reset().setEffectiveWeight(1).fadeIn(0.2).play();
+                } else if (prevLoop) {
+                  prevLoop.reset().setEffectiveWeight(1).fadeIn(0.2).play();
+                } else if (idle) {
+                  idle.reset().setEffectiveWeight(1).fadeIn(0.2).play();
+                }
+              } catch (err) {}
+              resolve();
+            }
+          };
+          mixer.addEventListener('finished', onFinished);
+        });
+      } catch (err) {
+        console.warn('ThreeCanvas: error playing queued mixamo gesture', err);
+      }
+      // Small pause between gestures
+      await new Promise((r) => setTimeout(r, 80));
+    }
+  } finally {
+    isProcessingMixamoRef.current = false;
+  }
+};
+
     useImperativeHandle(ref, () => ({
       playAudioWithEmotionAndLipSync: async (
         audioBase64OrUrl,
@@ -1457,82 +1554,123 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
       const currentMount = mountRef.current;
       console.log('ThreeCanvas: mount element dimensions:', currentMount.clientWidth, 'x', currentMount.clientHeight);
   const scene = new THREE.Scene();
-      const selectedBackground: BackgroundData =
-        backgroundData || backgrounds[backgroundPreset] || backgrounds.studio;
-  const textureLoader = new THREE.TextureLoader();
-  // Create ground only for non-studio backgrounds
-  let ground: THREE.Mesh | null = null;
-      switch (selectedBackground.name) {
-        case "Forest":
-          textureLoader.load("/textures/forest/forestbg.jpg", (texture) => {
-            texture.mapping = THREE.EquirectangularReflectionMapping;
-            scene.background = texture;
-            scene.environment = texture;
-          });
-          const forestFloorTexture = textureLoader.load(
-            "/textures/forest/Grass.jpg"
+      // Optional: render a separate background scene with a full-screen textured quad
+      // This allows using a generated image (data URL) or any image behind the 3D scene
+      let backgroundScene: THREE.Scene | null = null;
+      let backgroundCamera: THREE.Camera | null = null;
+      let backgroundPlane: THREE.Mesh | null = null;
+      let backgroundTexture: THREE.Texture | null = null;
+
+       const selectedBackground: BackgroundData =
+         backgroundData || backgrounds[backgroundPreset] || backgrounds.studio;
+       const textureLoader = new THREE.TextureLoader();
+      if (selectedBackground && selectedBackground.url) {
+        try {
+          backgroundScene = new THREE.Scene();
+          backgroundCamera = new THREE.Camera();
+          // Load texture (supports data: URLs)
+          backgroundTexture = textureLoader.load(
+            selectedBackground.url,
+            undefined,
+            undefined,
+            (err) => console.warn('ThreeCanvas: failed to load background texture', err)
           );
-          forestFloorTexture.wrapS = THREE.RepeatWrapping;
-          forestFloorTexture.wrapT = THREE.RepeatWrapping;
-          forestFloorTexture.repeat.set(25, 25);
-          ground = new THREE.Mesh(
-            new THREE.PlaneGeometry(100, 100),
-            new THREE.MeshStandardMaterial({ map: forestFloorTexture })
+          backgroundPlane = new THREE.Mesh(
+            new THREE.PlaneGeometry(2, 2),
+            new THREE.MeshBasicMaterial({ map: backgroundTexture })
           );
-          break;
-        case "City at Night":
-          textureLoader.load("/textures/city/cyberbg.jpg", (texture) => {
-            texture.mapping = THREE.EquirectangularReflectionMapping;
-            scene.background = texture;
-            scene.environment = texture;
-          });
-          const cityFloorTexture = textureLoader.load(
-            "/textures/city/floormetal.jpg"
-          );
-          cityFloorTexture.wrapS = THREE.RepeatWrapping;
-          cityFloorTexture.wrapT = THREE.RepeatWrapping;
-          cityFloorTexture.repeat.set(25, 25);
-          ground = new THREE.Mesh(
-            new THREE.PlaneGeometry(100, 100),
-            new THREE.MeshStandardMaterial({ map: cityFloorTexture })
-          );
-          break;
-        case "Venice Sunset HDR":
-        case "Royal Esplanade HDR":
-          if (selectedBackground.url) {
-            new RGBELoader().load(selectedBackground.url, (texture) => {
-              texture.mapping = THREE.EquirectangularReflectionMapping;
-              scene.background = texture;
-              scene.environment = texture;
-            });
-          }
-          ground = new THREE.Mesh(
-            new THREE.PlaneGeometry(100, 100),
-            new THREE.MeshPhongMaterial({ color: 0xbbbbbb, depthWrite: false })
-          );
-          break;
-        case "Studio":
-          // Keep the WebGL canvas fully transparent so the page CSS gradient shows through.
-          // No ground plane for studio to match the reference design.
-          ground = null;
-          break;
-        default:
-          scene.background = new THREE.Color(selectedBackground.color || 0xa0a0a0);
-          ground = new THREE.Mesh(
-            new THREE.PlaneGeometry(100, 100),
-            new THREE.MeshPhongMaterial({ color: 0xbbbbbb, depthWrite: false })
-          );
-          break;
+          // Ensure the background quad renders behind the main scene
+          backgroundPlane.frustumCulled = false;
+          (backgroundPlane.material as THREE.Material).depthTest = false;
+          backgroundPlane.renderOrder = -1;
+          backgroundScene.add(backgroundPlane);
+        } catch (e) {
+          console.warn('ThreeCanvas: error creating background scene', e);
+          backgroundScene = null;
+        }
+      }
+      // Create ground only for non-studio backgrounds. If a custom background
+      // image URL is provided (data URL from backend), we keep the WebGL canvas
+      // transparent and do NOT create a ground or set scene.background so the
+      // page-level CSS background image remains visible behind the model.
+      let ground: THREE.Mesh | null = null;
+      if (!selectedBackground.url) {
+        switch (selectedBackground.name) {
+         case "Forest":
+           textureLoader.load("/textures/forest/forestbg.jpg", (texture) => {
+             texture.mapping = THREE.EquirectangularReflectionMapping;
+             scene.background = texture;
+             scene.environment = texture;
+           });
+           const forestFloorTexture = textureLoader.load(
+             "/textures/forest/Grass.jpg"
+           );
+           forestFloorTexture.wrapS = THREE.RepeatWrapping;
+           forestFloorTexture.wrapT = THREE.RepeatWrapping;
+           forestFloorTexture.repeat.set(25, 25);
+           ground = new THREE.Mesh(
+             new THREE.PlaneGeometry(100, 100),
+             new THREE.MeshStandardMaterial({ map: forestFloorTexture })
+           );
+           break;
+         case "City at Night":
+           textureLoader.load("/textures/city/cyberbg.jpg", (texture) => {
+             texture.mapping = THREE.EquirectangularReflectionMapping;
+             scene.background = texture;
+             scene.environment = texture;
+           });
+           const cityFloorTexture = textureLoader.load(
+             "/textures/city/floormetal.jpg"
+           );
+           cityFloorTexture.wrapS = THREE.RepeatWrapping;
+           cityFloorTexture.wrapT = THREE.RepeatWrapping;
+           cityFloorTexture.repeat.set(25, 25);
+           ground = new THREE.Mesh(
+             new THREE.PlaneGeometry(100, 100),
+             new THREE.MeshStandardMaterial({ map: cityFloorTexture })
+           );
+           break;
+         case "Venice Sunset HDR":
+         case "Royal Esplanade HDR":
+           if (selectedBackground.url) {
+             new RGBELoader().load(selectedBackground.url, (texture) => {
+               texture.mapping = THREE.EquirectangularReflectionMapping;
+               scene.background = texture;
+               scene.environment = texture;
+             });
+           }
+           ground = new THREE.Mesh(
+             new THREE.PlaneGeometry(100, 100),
+             new THREE.MeshPhongMaterial({ color: 0xbbbbbb, depthWrite: false })
+           );
+           break;
+         case "Studio":
+           // Keep the WebGL canvas fully transparent so the page CSS gradient shows through.
+           // No ground plane for studio to match the reference design.
+           ground = null;
+           break;
+         default:
+           scene.background = new THREE.Color(selectedBackground.color || 0xa0a0a0);
+           ground = new THREE.Mesh(
+             new THREE.PlaneGeometry(100, 100),
+             new THREE.MeshPhongMaterial({ color: 0xbbbbbb, depthWrite: false })
+           );
+           break;
+        }
+      } else {
+        // Custom/background image provided — keep scene background null and no ground
+        scene.background = null;
+        ground = null;
       }
       if (ground) {
         ground.rotation.x = -Math.PI / 2;
         ground.receiveShadow = true;
         scene.add(ground);
       }
-      const safeAspect = currentMount.clientHeight
-        ? currentMount.clientWidth / currentMount.clientHeight
-        : 1;
-      const camera = new THREE.PerspectiveCamera(45, safeAspect, 0.1, 1000);
+    const safeAspect = currentMount.clientHeight
+      ? currentMount.clientWidth / currentMount.clientHeight
+      : 1;
+    const camera = new THREE.PerspectiveCamera(45, safeAspect, 0.1, 1000);
   // Lowered initial camera Y and moved closer (smaller Z) so follow preserves a lower view.
   camera.position.set(-0.13, 1.2, 1.63);
   // Seed last good camera transform
@@ -1557,7 +1695,7 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
       dirLight.position.set(3, 10, 10);
       dirLight.castShadow = true;
       scene.add(dirLight);
-  const controls = new OrbitControls(camera, renderer.domElement);
+      const controls = new OrbitControls(camera, renderer.domElement);
   // Align control target Y with camera Y so initial view height matches camera position
   controls.target.set(0, camera.position.y, 0);
       controls.enableDamping = true;
@@ -1567,6 +1705,10 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
       // Expose camera/controls to other helpers
       cameraRef.current = camera;
       controlsRef.current = controls;
+
+      // Ensure we render the background scene first (if present) then the main scene.
+      // Use autoClear=false so we can composite both scenes.
+      renderer.autoClear = false;
 
       // Animation/render loop
       const clock = new THREE.Clock();
@@ -1682,6 +1824,15 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
         }
 
         try { controls.update(); } catch (e) {}
+        // Clear once, then render background (fullscreen quad) then main scene
+        try {
+          renderer.clear();
+          if (backgroundScene && backgroundCamera) {
+            renderer.render(backgroundScene, backgroundCamera);
+          }
+        } catch (err) {
+          // ignore background rendering errors
+        }
         renderer.render(scene, camera);
       };
       animate();
@@ -1755,6 +1906,14 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
         try {
           if (mountRef.current && renderer.domElement) {
             currentMount.removeChild(renderer.domElement);
+          }
+        } catch (e) {}
+        try {
+          // Dispose background resources if created
+          if (backgroundTexture) backgroundTexture.dispose();
+          if (backgroundPlane) {
+            try { backgroundPlane.geometry.dispose(); } catch (e) {}
+            try { (backgroundPlane.material as any).dispose(); } catch (e) {}
           }
         } catch (e) {}
         try { (renderer as any)._idleSeqCleanup?.(); } catch (e) {}

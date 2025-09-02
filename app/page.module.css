@@ -34,7 +34,8 @@
   content: '';
   position: absolute;
   inset: 0;
-  background-image: url('/wave.png');
+  /* dynamic image comes from the inline style --wave-image set by React */
+  background-image: var(--wave-image, url('/wave.png'));
   background-repeat: repeat-x;
   background-position: top center;
   opacity: 0.10;
