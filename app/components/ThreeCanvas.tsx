@@ -1176,9 +1176,9 @@ const processMixamoQueue = async () => {
                   enableDamping: controls.enableDamping,
                   dampingFactor: controls.dampingFactor,
                 };
-                controls.enablePan = false;
-                controls.enableRotate = false; // ensure perfect centering
-                controls.enableDamping = false; // avoid damping-induced drift
+                controls.enablePan = true;
+                controls.enableRotate = true; // ensure perfect centering
+                controls.enableDamping = true; // avoid damping-induced drift
                 controls.update();
 
                 isFollowingRef.current = true;

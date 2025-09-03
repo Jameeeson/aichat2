@@ -248,19 +248,31 @@ export default function Home() {
         background_imageBase64,
       } = result;
 
-      // Prefer any of the known background base64 keys
+
+      // STEP 1: Set the background first and pause for it to render.
       const bg64 = background_image || background_image_base64 || background_imageBase64 || null;
-
-      if (!answer) {
-        throw new Error("Invalid or incomplete response from companion API");
+      if (bg64) {
+         try {
+          console.log('page.tsx: Setting new background...');
+          if (typeof bg64 === 'string' && bg64.startsWith('data:')) {
+            setCustomBackgroundUrl(bg64);
+          } else {
+            const guessedMime = typeof bg64 === 'string' && bg64.slice(0,4) === '/9j/' ? 'image/jpeg' : 'image/png';
+            setCustomBackgroundUrl(`data:${guessedMime};base64,${bg64}`);
+          }
+          // Add a small delay to give React time to render the new background
+          // before the character starts talking. This makes the sequence feel more natural.
+          await new Promise(resolve => setTimeout(resolve, 200)); // 200ms pause
+         } catch (e) {
+           console.warn('Failed to set custom background image from backend', e);
+         }
       }
-      
-  // append assistant message to history
-  // strip any bracketed tags from the visible message (tags still used for animation control)
-  const visible = String(answer).replace(/\[[^\]]*\]/g, '').replace(/\s+/g, ' ').trim();
-  setMessages(prev => [...prev, { role: 'assistant', text: visible }]);
 
-      // Prepare optional assets
+      // STEP 2: Now that the scene is set, process and display the message.
+      const visible = String(answer).replace(/\[[^\]]*\]/g, '').replace(/\s+/g, ' ').trim();
+      setMessages(prev => [...prev, { role: 'assistant', text: visible }]);
+
+      // Process assets for playback
       let processedVisemes: Array<{ time: number; value: string; jaw: number }> | null = null;
       let audioDataUri: string | null = null;
       if (audio_base64 && rawVisemeCues && Array.isArray(rawVisemeCues)) {
@@ -279,13 +291,10 @@ export default function Home() {
         ? bvhFileNames.map((fileName: string) => `${BACKEND_URL}/generated_bvh/${fileName}`)
         : [];
 
-  // mixamo_animation handling removed — gestures are no longer supported
-
-      // NEW ORDER: Speak first, then do the motion
+      // STEP 3: Play speech and animations sequentially.
       if (canvasRef.current) {
-        // 1) Speech (if available)
+        // Play speech (and parallel gestures)
         if (audioDataUri && processedVisemes) {
-          // Play speech and gestures in parallel (gestures overlay on top of talking)
           const speech = canvasRef.current.playAudioWithEmotionAndLipSync(
             audioDataUri,
             processedVisemes,
@@ -296,55 +305,24 @@ export default function Home() {
             try {
               const urls = Array.isArray(mixamo_animation) ? mixamo_animation : [mixamo_animation];
               const converted = urls.map((p: string) => (p.startsWith('/') ? p : `/gesturesanimation/${p}`));
-              console.log('page.tsx: playing gestures', converted);
-              // fire-and-forget so gestures overlay while speaking
               canvasRef.current.playGestures(converted).catch((e) => console.warn(e));
             } catch (e) {
               console.warn('Failed to start gestures', e);
             }
           }
-
-          await speech;
+          await speech; // Wait for speech to complete
         }
-        // 2) Motion (if available)
+
+        // After speech, play the main body motion
         if (bvhUrls.length > 0) {
           await canvasRef.current.playAnimation(bvhUrls[0]);
         }
       }
 
-      // Handle optional background image (base64)
-      if (bg64) {
-         // Log receipt of backend-generated background image (avoid printing full base64)
-         try {
-          const len = typeof bg64 === 'string' ? bg64.length : undefined;
-          console.log('page.tsx: received background image from backend', { length: len });
-         } catch (e) {
-           console.log('page.tsx: received background_image from backend');
-         }
-         // Backend may already send a full data URL or raw base64.
-         try {
-          if (typeof bg64 === 'string' && bg64.startsWith('data:')) {
-            setCustomBackgroundUrl(bg64);
-          } else {
-            // Heuristic: JPEG base64 often starts with '/9j/'
-            const guessedMime = typeof bg64 === 'string' && bg64.slice(0,4) === '/9j/' ? 'image/jpeg' : 'image/png';
-            setCustomBackgroundUrl(`data:${guessedMime};base64,${bg64}`);
-           }
-         } catch (e) {
-           console.warn('Failed to set custom background image from backend', e);
-           // fallback: clear custom background so UI uses selected preset
-           setCustomBackgroundUrl(null);
-         }
-       } else {
-         // No background returned — clear any previous generated background so
-         // the UI falls back to the selected preset/background pack.
-         setCustomBackgroundUrl(null);
-       }
-
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : "An unknown error occurred.";
       console.error("Chat submission error:", error);
-  setMessages(prev => [...prev, { role: 'assistant', text: `Error: ${errorMessage}` }]);
+      setMessages(prev => [...prev, { role: 'assistant', text: `Error: ${errorMessage}` }]);
     } finally {
       setIsSending(false);
     }
