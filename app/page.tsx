@@ -280,7 +280,7 @@ export default function Home() {
          }
       }
 
-      // STEP 2: Now that the scene is set, decide flow.
+  // STEP 2: Now that the scene is set, decide flow.
       // If the backend is using the new audio-first manifest flow, defer showing
       // the full response: we'll append per-step messages when polling the manifest.
       const visible = String(answer || '')
@@ -289,21 +289,13 @@ export default function Home() {
         .replace(/\s+/g, ' ')
         .trim();
       
-      // Check if this is actually a manifest flow (has generation_status, request_id AND steps)
-      // vs a single response that might have these fields but no actual steps
-      const isManifestFlow = generation_status && request_id && Array.isArray(steps) && steps.length > 0;
+  // Treat presence of request_id as a strong signal to use manifest polling,
+  // even if the initial payload doesn't include steps yet. This avoids playing
+  // a single early BVH and ensures we talk → BVH → next step for all steps.
+  const isLikelyManifest = Boolean(request_id);
+  const hasManifestSteps = Array.isArray(steps) && steps.length > 0;
       
-      if (!isManifestFlow) {
-        // Single response: show message immediately
-        setMessages(prev => [...prev, { role: 'assistant', text: visible }]);
-      } else {
-        // True manifest flow: mark request id and do NOT append full text now
-        manifestRequestIdRef.current = String(request_id);
-        playedStepIndexRef.current = 0;
-        // If the companion included immediate step audio/text (step 0), play it now below
-      }
-
-  // Process assets for playback (immediate assets for step-1)
+      // Process assets for playback (immediate assets for step-1)
       let processedVisemes: Array<{ time: number; value: string; jaw: number }> | null = null;
       let audioDataUri: string | null = null;
       if (audio_base64 && rawVisemeCues && Array.isArray(rawVisemeCues)) {
@@ -322,35 +314,38 @@ export default function Home() {
         ? bvhFileNames.map((fileName: string) => `${BACKEND_URL}/generated_bvh/${fileName}`)
         : [];
 
+      // NEW: Check for client-side stepwise parsing of multi-step responses
+      const hasStepPattern = /Step\s+\d+:/i.test(visible);
+      const shouldParseSteps = hasStepPattern && !isLikelyManifest && visible.length > 200;
+      
+      if (!isLikelyManifest && !shouldParseSteps) {
+        // Single response: show message immediately
+        setMessages(prev => [...prev, { role: 'assistant', text: visible }]);
+      } else if (shouldParseSteps) {
+        // Client-side stepwise parsing: extract steps and play them one by one
+        console.log('page.tsx: Parsing multi-step response client-side');
+        const parsedSteps = parseStepsFromText(visible);
+        console.log('page.tsx: Parsed steps:', parsedSteps);
+        console.log('page.tsx: Available BVH URLs:', bvhUrls);
+        await playStepsSequentially(parsedSteps, audioDataUri, processedVisemes, emotion, bvhUrls);
+        return; // Exit early to avoid duplicate playback
+      } else if (isLikelyManifest) {
+        // Manifest flow (preferred when request_id exists): start polling and avoid
+        // playing a single early BVH or full response audio which would break sequencing.
+        manifestRequestIdRef.current = String(request_id);
+        playedStepIndexRef.current = 0;
+        if (manifestCancelRef.current) {
+          manifestCancelRef.current();
+        }
+        manifestCancelRef.current = startManifestPolling(String(request_id));
+        // Defer UI text display to polling (per-step). Avoid further immediate playback.
+        return;
+      }
+
       // STEP 3: Play immediate speech/BVH for step-1 if present, otherwise start polling
       if (canvasRef.current) {
-        // If we're in true manifest flow and companion provided immediate audio for step-1, play it
-        if (isManifestFlow && generation_status === 'partial' && request_id) {
-          if (audioDataUri && processedVisemes) {
-            try {
-              await canvasRef.current.playAudioWithEmotionAndLipSync(audioDataUri, processedVisemes, emotion || 'neutral');
-            } catch (e) { console.warn('Immediate manifest audio play failed', e); }
-          }
-          if (bvhUrls.length > 0) {
-            try {
-              // Play BVHs sequentially using the canvas method (mirrors working snippet behavior)
-              for (const u of bvhUrls) {
-                await canvasRef.current?.playAnimation(u);
-              }
-            } catch (e) { console.warn('Immediate manifest BVH play failed', e); }
-            // After BVH finishes, ensure the model returns to idle pose
-            try { canvasRef.current?.resetToIdle?.(); } catch (e) {}
-          }
-          
-          // CRITICAL FIX: Mark step 1 as already played to prevent double playback
-          playedStepIndexRef.current = 1;
-          
-          // Start polling the manifest for subsequent steps (will start from step 2)
-          if (manifestCancelRef.current) {
-            manifestCancelRef.current();
-          }
-          manifestCancelRef.current = startManifestPolling(String(request_id));
-        } else {
+        // Single-response flow: play speech then BVH as before
+        {
           // Single-response flow: play speech then BVH as before
           if (audioDataUri && processedVisemes) {
             const speech = canvasRef.current.playAudioWithEmotionAndLipSync(
@@ -385,6 +380,107 @@ export default function Home() {
       setMessages(prev => [...prev, { role: 'assistant', text: `Error: ${errorMessage}` }]);
     } finally {
       setIsSending(false);
+    }
+  };
+
+  // Helper: parse steps from multi-step text response
+  const parseStepsFromText = (text: string): Array<{index: number, text: string, step: string}> => {
+    const steps: Array<{index: number, text: string, step: string}> = [];
+    
+    // Improved regex to capture steps across multiple lines
+    const stepMatches = text.match(/Step\s+\d+:[^]*?(?=Step\s+\d+:|$)/gi);
+    console.log('page.tsx: parseStepsFromText - raw matches:', stepMatches);
+    
+    if (stepMatches) {
+      stepMatches.forEach((stepText, index) => {
+        // Clean up the text by removing action descriptions in {{}} and the step number
+        const cleanText = stepText
+          .replace(/\{\{.*?\}\}/g, '') // Remove {{action descriptions}}
+          .replace(/Step\s+\d+:\s*/i, '') // Remove "Step X:"
+          .replace(/\s+/g, ' ') // Normalize whitespace
+          .trim();
+        
+        console.log(`page.tsx: parseStepsFromText - step ${index + 1}:`, {
+          raw: stepText.substring(0, 100) + '...',
+          cleaned: cleanText
+        });
+        
+        if (cleanText) {
+          steps.push({
+            index: index + 1,
+            text: cleanText,
+            step: cleanText
+          });
+        }
+      });
+    }
+    
+    console.log('page.tsx: parseStepsFromText - final steps:', steps);
+    return steps;
+  };
+
+  // Helper: play parsed steps sequentially with timing
+  const playStepsSequentially = async (
+    steps: Array<{index: number, text: string, step: string}>,
+    fullAudioUri: string | null,
+    fullVisemes: any[] | null,
+    emotion: string,
+    bvhUrls: string[]
+  ) => {
+    try {
+      console.log('page.tsx: playStepsSequentially started', {
+        stepsCount: steps.length,
+        hasAudio: !!fullAudioUri,
+        hasVisemes: !!fullVisemes,
+        bvhCount: bvhUrls.length
+      });
+
+      // First, play the full audio with lip sync if available
+      if (fullAudioUri && fullVisemes && canvasRef.current) {
+        console.log('page.tsx: Playing full audio...');
+        await canvasRef.current.playAudioWithEmotionAndLipSync(fullAudioUri, fullVisemes, (emotion as any) || 'neutral');
+        console.log('page.tsx: Full audio completed');
+      }
+
+      // Then show each step text progressively with a delay
+      console.log('page.tsx: Starting step-by-step display...');
+      for (let i = 0; i < steps.length; i++) {
+        const step = steps[i];
+        console.log(`page.tsx: Processing step ${step.index}/${steps.length}:`, step.text);
+        
+        // Add the step text to chat
+        setMessages(prev => [...prev, { role: 'assistant', text: `Step ${step.index}: ${step.text}` }]);
+        
+        // Play corresponding BVH if available
+        if (bvhUrls[i] && canvasRef.current) {
+          console.log(`page.tsx: Playing BVH ${i+1}: ${bvhUrls[i]}`);
+          try {
+            await canvasRef.current.playAnimation(bvhUrls[i]);
+            console.log(`page.tsx: BVH ${i+1} completed`);
+          } catch (e) {
+            console.warn(`Failed to play BVH for step ${step.index}:`, e);
+          }
+        } else {
+          console.log(`page.tsx: No BVH available for step ${step.index} (index ${i})`);
+        }
+        
+        // Small delay between steps (except for the last step)
+        if (i < steps.length - 1) {
+          console.log('page.tsx: Waiting 1 second before next step...');
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+      }
+
+      console.log('page.tsx: All steps completed, resetting to idle');
+      // Reset to idle after all steps complete
+      if (canvasRef.current) {
+        try { canvasRef.current.resetToIdle?.(); } catch (e) {}
+      }
+    } catch (error) {
+      console.error('Error in playStepsSequentially:', error);
+      // Fallback: show all steps at once
+      const allStepsText = steps.map(s => `Step ${s.index}: ${s.text}`).join('\n\n');
+      setMessages(prev => [...prev, { role: 'assistant', text: allStepsText }]);
     }
   };
 
