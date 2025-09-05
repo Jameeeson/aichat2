@@ -6,6 +6,7 @@ import ThreeCanvas from "./ThreeCanvas";
 import styles from "./CharacterController.module.css";
 // Make sure to import the Emotion type as well
 import type { ThreeCanvasHandles, Emotion } from "./ThreeCanvas";
+import { bvhPlayer } from "./BVHAnimationPlayer";
 
 // Remove bracketed tokens like [Wave] or [Talkinganimation] for UI display
 const sanitizeResponse = (text: string | null | undefined) => {
@@ -85,9 +86,24 @@ export default function CharacterController() {
 
   const canvasRef = useRef<ThreeCanvasHandles>(null);
   const lastGeneratedFiles = useRef<string[]>([]);
+  // Manifest/polling refs for incremental BVH/audio steps
+  const manifestRequestIdRef = useRef<string | null>(null);
+  const manifestCancelRef = useRef<(() => void) | null>(null);
+  const playedStepIndexRef = useRef<number>(0);
 
   const handleTalk = async () => {
     if (isSubmittingTalk || !talkPrompt.trim()) return;
+    // Cancel any existing manifest polling / playback
+    try {
+      if (manifestCancelRef.current) {
+        manifestCancelRef.current();
+        manifestCancelRef.current = null;
+        manifestRequestIdRef.current = null;
+        playedStepIndexRef.current = 0;
+      }
+      // Stop any active audio/animation on the canvas
+      canvasRef.current?.resetToIdle?.();
+    } catch (e) {}
 
     setIsSubmittingTalk(true);
     setStatus("Thinking...");
@@ -113,63 +129,93 @@ export default function CharacterController() {
       });
       if (!companionResponse.ok)
         throw new Error(`API failed: ${companionResponse.status}`);
-  const companionJson = await companionResponse.json();
-  console.log("CharacterController: full companion JSON:", companionJson);
-  const { response: answer, mixamo_animation } = companionJson;
-      if (!answer) throw new Error("Invalid response from companion");
+      const companionJson = await companionResponse.json();
+      console.log("CharacterController: full companion JSON:", companionJson);
 
-  setChatMessage(sanitizeResponse(answer));
-      // If the backend returned a Mixamo gesture name, tell the canvas to play it.
-  // mixamo_animation handling removed — gestures are no longer supported
+      // New fields supported by backend: request_id, generation_status, steps, step_texts
+      const {
+        response: answer,
+        audio_base64,
+        visemes,
+        bvh_files,
+        generation_status,
+        request_id,
+        steps,
+        step_texts,
+        emotion,
+        mixamo_animation,
+      } = companionJson || {};
+
+      if (!answer && !request_id) throw new Error("Invalid response from companion");
+
+      setChatMessage(sanitizeResponse(answer || ""));
       setStatus("Generating audio...");
       setTalkPrompt("");
 
-      const audioResponse = await fetch(`${BACKEND_URL}/ask`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text: answer,
-          character: selectedCharKey,
-          background: selectedBgKey,
-        }),
-      });
-      if (!audioResponse.ok) throw new Error("TTS API failed");
-      const audioJson = await audioResponse.json();
-      const { audio_base64, visemes, emotion } = audioJson; // Expect emotion from backend
-
-  if (canvasRef.current && audio_base64) {
-        setIsAudioPlaying(true);
-        setStatus("Talking...");
-
-        // --- FIX 1: Use the correct function and pass the emotion ---
-        const audioDataUri = `data:audio/mp3;base64,${audio_base64}`;
-        // Start speech in parallel with any gestures
-        const speechPromise = canvasRef.current.playAudioWithEmotionAndLipSync(
-          audioDataUri,
-          visemes || [],
-          emotion || "neutral"
-        );
-
-        // If backend suggested a Mixamo gesture (string or array), play it as overlay(s)
-        if (mixamo_animation && canvasRef.current.playGestures) {
+      // If backend immediately returned step-1 audio (audio-first flow), play it now
+      if (generation_status === 'partial' && request_id) {
+        // remember the active manifest request
+        manifestRequestIdRef.current = String(request_id);
+        // If companion included immediate audio for first step
+        if (audio_base64) {
           try {
-            const urls = Array.isArray(mixamo_animation)
-              ? mixamo_animation
-              : [mixamo_animation];
-            // Convert backend paths (/gesturesanimation/Waving.fbx) to frontend URLs if necessary
-            const converted = urls.map((p) => (p.startsWith('/') ? p : `/gesturesanimation/${p}`));
-            console.log('CharacterController: playing gestures', converted);
-            // Play gestures but don't await here so they overlay the talking animation
-            canvasRef.current.playGestures(converted).catch((e) => console.warn(e));
-          } catch (err) {
-            console.warn('Failed to play gestures', err);
+            setIsAudioPlaying(true);
+            const audioDataUri = `data:audio/mp3;base64,${audio_base64}`;
+            const mappedVisemes = (visemes || []).map((cue: any) => {
+              const entry = (rhubarbToVisemeMap as any)[cue.value] || (rhubarbToVisemeMap as any)['X'];
+              return { time: cue.start, value: entry.viseme, jaw: entry.jaw };
+            });
+            await canvasRef.current?.playAudioWithEmotionAndLipSync?.(audioDataUri, mappedVisemes, emotion || 'neutral');
+            setIsAudioPlaying(false);
+          } catch (e) {
+            console.warn('Failed to play immediate companion audio', e);
+            setIsAudioPlaying(false);
           }
         }
 
-        await speechPromise;
+        // Play immediate BVH files returned with companion for step-1
+        if (Array.isArray(bvh_files) && bvh_files.length > 0) {
+          const urls = bvh_files.map((f: string) => `${BACKEND_URL}/generated_bvh/${f}`);
+          await playBVHUrls(urls);
+        }
 
-        setIsAudioPlaying(false);
+        // begin polling manifest for remaining steps
+        manifestCancelRef.current = startManifestPolling(String(request_id));
+      } else {
+        // Fallback old flow: ask /ask for audio for the assistant answer then play
+        const audioResponse = await fetch(`${BACKEND_URL}/ask`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text: answer,
+            character: selectedCharKey,
+            background: selectedBgKey,
+          }),
+        });
+        if (!audioResponse.ok) throw new Error("TTS API failed");
+        const audioJson = await audioResponse.json();
+        const { audio_base64: ab64, visemes: aVisemes, emotion: aEmotion } = audioJson; // Expect emotion from backend
+
+        if (canvasRef.current && ab64) {
+          setIsAudioPlaying(true);
+          const audioDataUri = `data:audio/mp3;base64,${ab64}`;
+          const mapped = (aVisemes || []).map((cue: any) => {
+            const entry = (rhubarbToVisemeMap as any)[cue.value] || (rhubarbToVisemeMap as any)['X'];
+            return { time: cue.start, value: entry.viseme, jaw: entry.jaw };
+          });
+          const speechPromise = canvasRef.current.playAudioWithEmotionAndLipSync?.(audioDataUri, mapped, aEmotion || 'neutral');
+          if (mixamo_animation && canvasRef.current.playGestures) {
+            try {
+              const urls = Array.isArray(mixamo_animation) ? mixamo_animation : [mixamo_animation];
+              const converted = urls.map((p: string) => (p.startsWith('/') ? p : `/gesturesanimation/${p}`));
+              canvasRef.current.playGestures?.(converted).catch((e) => console.warn(e));
+            } catch (err) { console.warn('Failed to play gestures', err); }
+          }
+          await speechPromise;
+          setIsAudioPlaying(false);
+        }
       }
+
       setStatus("Completed");
       setTimeout(() => setIsChatVisible(false), 2000);
     } catch (error) {
@@ -223,6 +269,114 @@ export default function CharacterController() {
     } finally {
       setIsGeneratingMotion(false);
     }
+  };
+
+  // Helper: play BVH URLs using the bvhPlayer and ThreeCanvas animation objects
+  const playBVHUrls = async (urls: string[]) => {
+    try {
+      if (!canvasRef.current) return;
+      const objs = canvasRef.current.getAnimationObjects();
+      if (!objs || !objs.mixer || !objs.model || !objs.idleAction) {
+        console.warn('playBVHUrls: animation objects not ready');
+        return;
+      }
+      // objs fields are nullable in the public API; assert non-null for bvhPlayer
+      const params = {
+        mixer: objs.mixer,
+        model: objs.model,
+        idleAction: objs.idleAction,
+      } as unknown as { mixer: any; model: any; idleAction: any };
+      await bvhPlayer.play(params, urls);
+    } catch (e) {
+      console.warn('BVH play failed', e);
+    }
+  };
+
+  // Manifest polling helper. Returns a cancel function.
+  const startManifestPolling = (requestId: string) => {
+    let cancelled = false;
+    let playedIndex = playedStepIndexRef.current || 0;
+    let emptyPollCount = 0;
+    const pollIntervalMs = 1000;
+    const maxEmptyBeforeBackoff = 6;
+
+    const mapRhCuesToVisemes = (raw: any[]) => {
+      return (raw || []).map((cue: any) => {
+        const entry = (rhubarbToVisemeMap as any)[cue.value] || (rhubarbToVisemeMap as any)['X'];
+        return { time: cue.start, value: entry.viseme, jaw: entry.jaw };
+      });
+    };
+
+    const pollOnce = async () => {
+      if (cancelled) return;
+      try {
+        const res = await fetch(`${BACKEND_URL}/api/companion/status/${requestId}`);
+        if (!res.ok) throw new Error(`manifest fetch failed: ${res.status}`);
+        const manifest = await res.json();
+        const steps = manifest.steps || [];
+
+        for (let i = playedIndex; i < steps.length; i++) {
+          if (cancelled) return;
+          const step = steps[i];
+          const hasAudio = !!step.audio_base64;
+          const hasBVH = Array.isArray(step.bvh_files) && step.bvh_files.length > 0;
+
+          if (hasAudio) {
+            try {
+              const audioUri = `data:audio/mp3;base64,${step.audio_base64}`;
+              const mapped = mapRhCuesToVisemes(step.visemes || []);
+              await canvasRef.current?.playAudioWithEmotionAndLipSync?.(audioUri, mapped, manifest.emotion || 'neutral');
+            } catch (err) {
+              console.warn('Manifest audio play failed for step', i, err);
+            }
+          } else if (step.step) {
+            // fallback: call /ask for this step text
+            try {
+              const askRes = await fetch(`${BACKEND_URL}/ask`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: step.step, character: selectedCharKey, background: selectedBgKey }),
+              });
+              if (askRes.ok) {
+                const askJson = await askRes.json();
+                if (askJson.audio_base64) {
+                  const audioUri = `data:audio/mp3;base64,${askJson.audio_base64}`;
+                  const mapped = mapRhCuesToVisemes(askJson.visemes || []);
+                  await canvasRef.current?.playAudioWithEmotionAndLipSync?.(audioUri, mapped, askJson.emotion || 'neutral');
+                }
+              }
+            } catch (err) {
+              console.warn('Fallback /ask failed for manifest step', i, err);
+            }
+          }
+
+          if (hasBVH) {
+            const urls = step.bvh_files.map((f: string) => `${BACKEND_URL}/generated_bvh/${f}`);
+            await playBVHUrls(urls);
+          }
+
+          playedIndex = i + 1;
+          playedStepIndexRef.current = playedIndex;
+        }
+
+        if (manifest.complete && playedIndex >= (manifest.steps || []).length) {
+          // done
+          return;
+        }
+
+        if ((steps.length === playedIndex) || steps.length === 0) emptyPollCount++; else emptyPollCount = 0;
+        const nextInterval = emptyPollCount > maxEmptyBeforeBackoff ? Math.min(5000, pollIntervalMs * 3) : pollIntervalMs;
+        if (!cancelled) setTimeout(pollOnce, nextInterval);
+      } catch (err) {
+        console.warn('Manifest poll error', err);
+        if (!cancelled) setTimeout(pollOnce, 3000);
+      }
+    };
+
+    // start
+    pollOnce();
+
+    return () => { cancelled = true; };
   };
 
   const handleTestMotion = async () => {

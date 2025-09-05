@@ -526,7 +526,7 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
   // Desired front-view camera settings during follow (tweak to taste)
   // Use a small distance and zero side to stay centered and closer to the character.
   // Lowered height so follow view isn't too high above the character.
-  const followViewRef = useRef({ distance: 2, height: 0, side: 1.2 });
+  const followViewRef = useRef({ distance: 3, height: 1, side: 1.5 });
 
       const playAudioWithEmotionAndLipSync = async (
       audioUrl: string,
@@ -1085,174 +1085,68 @@ const processMixamoQueue = async () => {
                 return reject(new Error("BVH file has no animation data"));
               }
 
-              // Clean reset like debug.html
-              // Release any frozen typing pose so BVH retarget doesn't inherit a look-down
-              clearTypingHoldTimeout();
-              typingActiveRef.current = false;
-              typingHeadQuatRef.current = null;
-              typingNeckQuatRef.current = null;
-
-              mixer.stopAllAction();
-              bodyMesh.skeleton.pose();
-              // Restore neutral head/neck base pose if available so BVH starts from a neutral orientation
-              try {
-                if (hasCapturedBasePoseRef.current) {
-                  if (headBoneRef.current) headBoneRef.current.quaternion.copy(headBaseQuatRef.current);
-                  if (neckBoneRef.current) neckBoneRef.current.quaternion.copy(neckBaseQuatRef.current);
-                  // Reset the model root transform so BVH starts facing forward
-                  if (modelRootRef.current) {
-                    modelRootRef.current.position.copy(modelStartPosRef.current);
-                    modelRootRef.current.quaternion.copy(modelStartQuatRef.current);
-                    (modelRootRef.current as any)?.updateMatrixWorld?.(true);
-                  }
+              console.log("✅ BVH Animation loaded:", url);
+              
+              // Simple retarget exactly like the working HTML example
+              const options = {
+                hip: 'Hips',
+                names: {
+                  'Spine': 'Spine',
+                  'Spine1': 'Spine1', 
+                  'Spine2': 'Spine2',
+                  'Neck': 'Neck',
+                  'Head': 'Head',
+                  'LeftShoulder': 'LeftShoulder',
+                  'LeftArm': 'LeftArm',
+                  'LeftForeArm': 'LeftForeArm', 
+                  'LeftHand': 'LeftHand',
+                  'RightShoulder': 'RightShoulder',
+                  'RightArm': 'RightArm',
+                  'RightForeArm': 'RightForeArm',
+                  'RightHand': 'RightHand',
+                  'LeftUpLeg': 'LeftUpLeg',
+                  'LeftLeg': 'LeftLeg',
+                  'LeftFoot': 'LeftFoot',
+                  'LeftToe': 'LeftToeBase',
+                  'RightUpLeg': 'RightUpLeg', 
+                  'RightLeg': 'RightLeg',
+                  'RightFoot': 'RightFoot',
+                  'RightToe': 'RightToeBase'
                 }
-              } catch (e) {}
+              };
 
-              // Optional: strip root translation if needed
-              // const stripped = bvh.clip.clone();
-              // stripped.tracks = stripped.tracks.filter(t => !t.name.endsWith('Hips.position'));
-
-              const clip = SkeletonUtils.retargetClip(
-                bodyMesh,
-                bvh.skeleton,
-                bvh.clip,
-                RPM_TPOSE_RETARGET_OPTIONS
-              );
-
-              // Dedupe wrist quaternion tracks to avoid over-rotation
-              const seenQuat = new Set<string>();
-              const deduped: THREE.KeyframeTrack[] = [];
-              for (const track of clip.tracks) {
-                if (
-                  track.name.endsWith(".quaternion") &&
-                  (track.name.startsWith("LeftHand.") ||
-                    track.name.startsWith("RightHand."))
-                ) {
-                  if (seenQuat.has(track.name)) {
-                    continue; // drop duplicates
-                  }
-                  seenQuat.add(track.name);
-                }
-                deduped.push(track);
-              }
-              clip.tracks = deduped;
-
-              const action = mixer.clipAction(clip, bodyMesh);
+              const retargetedClip = SkeletonUtils.retargetClip(bodyMesh, bvh.skeleton, bvh.clip, options);
+              
+              // Store original position and adjust Y during BVH playback
+              const originalPosition = bodyMesh.position.clone();
+              bodyMesh.position.y = originalPosition.y + 0.3; // Lift model slightly during BVH
+              
+              const action = mixer.clipAction(retargetedClip);
               action.setLoop(THREE.LoopOnce, 1);
               action.clampWhenFinished = true;
-
-              // Setup camera follow offsets relative to the model root
-              const camera = cameraRef.current;
-              const controls = controlsRef.current;
-              // Prefer following the pelvis/hips bone if available
-              const hipsBone = findPelvisBone(bodyMesh) as unknown as THREE.Object3D | null;
-              followAnchorRef.current = hipsBone || (bodyMesh as unknown as THREE.Object3D);
-              const anchor = followAnchorRef.current;
-              if (camera && controls && anchor) {
-                anchor.updateMatrixWorld?.(true);
-                const anchorPos = new THREE.Vector3();
-                anchor.getWorldPosition(anchorPos);
-                cameraStartPosRef.current.copy(camera.position);
-                controlsStartTargetRef.current.copy(controls.target);
-                // Front-of-character offset: in front (opposite forward), a bit above hips
-                const q = new THREE.Quaternion();
-                anchor.getWorldQuaternion(q);
-                const right = new THREE.Vector3(1, 0, 0).applyQuaternion(q);
-                const up = new THREE.Vector3(0, 1, 0).applyQuaternion(q);
-                const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(q);
-                const { distance, side } = followViewRef.current;
-                cameraOffsetRef.current
-                  .copy(right).multiplyScalar(side)
-                  .addScaledVector(forward, -distance);
-                // Debug log so we can verify the follow anchor and offset
-                console.log("follow enabled: anchor=", anchor.name || '(root)', "anchorPos=", anchorPos.toArray(), "offset=", cameraOffsetRef.current.toArray());
-                // Force the controls target to be exactly the anchor (center the character)
-                controlsOffsetRef.current.set(0, 0, 0);
-
-                // Disable user interactions that can push the target off-center during follow
-                prevControlsStateRef.current = {
-                  enablePan: controls.enablePan,
-                  enableRotate: controls.enableRotate,
-                  enableDamping: controls.enableDamping,
-                  dampingFactor: controls.dampingFactor,
-                };
-                controls.enablePan = true;
-                controls.enableRotate = true; // ensure perfect centering
-                controls.enableDamping = true; // avoid damping-induced drift
-                controls.update();
-
-                isFollowingRef.current = true;
-              }
-
-              idleAction.fadeOut(FADE_DURATION);
-              action.reset().fadeIn(FADE_DURATION).play();
+              action.play();
+              
+              console.log("✅ Animation retargeted and playing (simple approach like working example).");
 
               const onFinished = (e: any) => {
                 if (e.action === action) {
                   mixer.removeEventListener("finished", onFinished);
-
-                  // Async finish flow: fade out, reset pose and camera, fade in idle
-                  (async () => {
-                    try {
-                      isFollowingRef.current = false;
-                      const modelRootFinish = modelRootRef.current || bodyMesh.parent;
-                      if (modelRootFinish) {
-                        await fadeObjectOpacity(modelRootFinish, 0, OPACITY_FADE);
-                      }
-
-                      // Reset camera back to start
-                      const cam = cameraRef.current;
-                      const ctrls = controlsRef.current;
-                      if (cam && ctrls) {
-                        cam.position.copy(cameraStartPosRef.current);
-                        ctrls.target.copy(controlsStartTargetRef.current);
-                        // Restore controls settings
-                        const prev = prevControlsStateRef.current;
-                        if (prev) {
-                          ctrls.enablePan = prev.enablePan;
-                          ctrls.enableRotate = prev.enableRotate;
-                          ctrls.enableDamping = prev.enableDamping;
-                          ctrls.dampingFactor = prev.dampingFactor;
-                        } else {
-                          // Reasonable defaults if prev state missing
-                          ctrls.enablePan = true;
-                          ctrls.enableRotate = true;
-                          ctrls.enableDamping = true;
-                          ctrls.dampingFactor = 0.08;
-                        }
-                        ctrls.update();
-                      }
-
-                      // Reset skeleton/model and return to idle
-                      mixer.stopAllAction();
-                      action.stop();
-                      bodyMesh.skeleton.pose();
-                      const modelRootReset = modelRootRef.current || bodyMesh.parent;
-                      if (modelRootReset) {
-                        modelRootReset.position.copy(modelStartPosRef.current);
-                        modelRootReset.quaternion.copy(modelStartQuatRef.current);
-                        (modelRootReset as any).updateMatrixWorld?.(true);
-                      }
-
-                        idleAction.reset().setEffectiveWeight(1).fadeIn(FADE_DURATION).play();
-
-                      if (modelRootFinish) {
-                        await fadeObjectOpacity(modelRootFinish, 1, OPACITY_FADE);
-                      }
-                    } catch (err) {
-                      console.error(err);
-                      // Fallback to simple fade to idle
-                      idleAction.reset().setEffectiveWeight(1).fadeIn(1).play();
-                    } finally {
-                      resolve();
+                  try {
+                    action.stop();
+                    // Restore original position after BVH ends
+                    bodyMesh.position.copy(originalPosition);
+                    if (idleAction) {
+                      idleAction.reset().play();
                     }
-                  })();
+                  } catch {}
+                  resolve();
                 }
               };
               mixer.addEventListener("finished", onFinished);
             },
             undefined,
             (error) => {
+              console.error("Error loading BVH:", error);
               reject(error);
             }
           );
@@ -1352,6 +1246,7 @@ const processMixamoQueue = async () => {
 
       const characterModel = gltf.scene;
       console.log('ThreeCanvas: adding character model to scene:', characterModel);
+      
       scene.add(characterModel);
       bodyMeshRef.current =
         findBestSkinnedMesh(characterModel) ||
@@ -1400,7 +1295,9 @@ const processMixamoQueue = async () => {
           }
         }
       });
+      headBoneRef.current = characterModel.getObjectByName('Head') as THREE.Bone;
 
+      
       // Create idle actions for each loaded idle FBX. If multiple were provided
       // we'll sequence through them one-shot style; otherwise keep the single idle looping.
       const bodyTarget = bodyMeshRef.current || characterModel;
@@ -1717,6 +1614,27 @@ const processMixamoQueue = async () => {
         rafId = requestAnimationFrame(animate);
         const delta = clock.getDelta();
         try { mixerRef.current?.update(delta); } catch (e) {}
+
+         if (headBoneRef.current) {
+            const elapsedTime = clock.getElapsedTime();
+
+            // --- Parameters to control the head motion ---
+            const swayFrequency = 0.5; // Side-to-side tilt frequency
+            const swayAmplitude = 0.04; // Side-to-side tilt amount
+            const nodFrequency = 0.4;  // Up-down nod frequency
+            const nodAmplitude = 0.03;  // Up-down nod amount
+            
+            // --- THE FIX ---
+            // Base angle for chin down. -0.2 is a subtle look down. 
+            // The original value of -2 was too large (rotations are in radians).
+            const baseHeadXRotation = -0.2; 
+
+            // 1. SET the up/down rotation directly (overrides the animation).
+            headBoneRef.current.rotation.x = baseHeadXRotation + (Math.sin(elapsedTime * nodFrequency) * nodAmplitude);
+
+            // 2. ADD to the side-to-side tilt (layers on top of the animation).
+            headBoneRef.current.rotation.z += Math.sin(elapsedTime * swayFrequency) * swayAmplitude * delta;
+        }
 
         // Facial morphs: blink, visemes, and emotion
         const faceMesh: any = faceMeshRef.current;

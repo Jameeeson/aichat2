@@ -1,5 +1,6 @@
 // BVH Animation Handler for Three.js Avatar Projects
 // Extracted and adapted from main.tsx for reusable BVH animation functionality
+// MODIFIED to include procedural head animation and shoulder adjustments.
 
 import * as THREE from "three";
 import { BVHLoader } from "three/examples/jsm/loaders/BVHLoader.js";
@@ -9,31 +10,94 @@ import * as SkeletonUtils from "three/examples/jsm/utils/SkeletonUtils.js";
 interface RetargetOptions {
   hip: string;
   names: { [key: string]: string };
-  bindTransforms: any[];
+  bindTransforms?: any[]; // optional to match usage
+  preservePosition?: boolean;
+  useFirstFrameAsBindPose?: boolean;
 }
 
-const RPM_TPOSE_RETARGET_OPTIONS = {
-    preservePosition: false,
-    useFirstFrameAsBindPose: true,
-    hip: 'Hips',
-    names: { 'Hips': 'Hips', 'Spine': 'Spine', 'Spine1': 'Spine1', 'Spine2': 'Spine2', 'Neck': 'Neck', 'Head': 'Head', 'LeftShoulder': 'LeftShoulder', 'LeftArm': 'LeftArm', 'LeftForeArm': 'LeftForeArm', 'LeftHand': 'LeftHand', 'RightShoulder': 'RightShoulder', 'RightArm': 'RightArm', 'RightForeArm': 'RightForeArm', 'RightHand': 'RightHand', 'LeftUpLeg': 'LeftUpLeg', 'LeftLeg': 'LeftLeg', 'LeftFoot': 'LeftFoot', 'LeftToe': 'LeftToeBase', 'RightUpLeg': 'RightUpLeg', 'RightLeg': 'RightLeg', 'RightFoot': 'RightFoot', 'RightToe': 'RightToeBase', 'LeftHandThumb1': 'LeftHand', 'LeftHandThumb2': 'LeftHand', 'LeftHandThumb3': 'LeftHand', 'LeftHandIndex1': 'LeftHand', 'LeftHandIndex2': 'LeftHand', 'LeftHandIndex3': 'LeftHand', 'LeftHandMiddle1': 'LeftHand', 'LeftHandMiddle2': 'LeftHand', 'LeftHandMiddle3': 'LeftHand', 'LeftHandRing1': 'LeftHand', 'LeftHandRing2': 'LeftHand', 'LeftHandRing3': 'LeftHand', 'LeftHandPinky1': 'LeftHand', 'LeftHandPinky2': 'LeftHand', 'LeftHandPinky3': 'LeftHand', 'RightHandThumb1': 'RightHand', 'RightHandThumb2': 'RightHand', 'RightHandThumb3': 'RightHand', 'RightHandIndex1': 'RightHand', 'RightHandIndex2': 'RightHand', 'RightHandIndex3': 'RightHand', 'RightHandMiddle1': 'RightHand', 'RightHandMiddle2': 'RightHand', 'RightHandMiddle3': 'RightHand', 'RightHandRing1': 'RightHand', 'RightHandRing2': 'RightHand', 'RightHandRing3': 'RightHand', 'RightHandPinky1': 'RightHand', 'RightHandPinky2': 'RightHand', 'RightHandPinky3': 'RightHand' }
+const RPM_TPOSE_RETARGET_OPTIONS: RetargetOptions = {
+  hip: 'Hips',
+  preservePosition: false,
+  useFirstFrameAsBindPose: true,
+  names: {
+    Hips: 'Hips',
+    Spine: 'Spine',
+    Spine1: 'Spine1',
+    Spine2: 'Spine2',
+    Neck: 'Neck',
+    Head: 'Head',
+    LeftShoulder: 'LeftShoulder',
+    LeftArm: 'LeftArm',
+    LeftForeArm: 'LeftForeArm',
+    LeftHand: 'LeftHand',
+    RightShoulder: 'RightShoulder',
+    RightArm: 'RightArm',
+    RightForeArm: 'RightForeArm',
+    RightHand: 'RightHand',
+    LeftUpLeg: 'LeftUpLeg',
+    LeftLeg: 'LeftLeg',
+    LeftFoot: 'LeftFoot',
+    LeftToe: 'LeftToeBase',
+    RightUpLeg: 'RightUpLeg',
+    RightLeg: 'RightLeg',
+    RightFoot: 'RightFoot',
+    RightToe: 'RightToeBase',
+    // Fingers intentionally omitted to avoid over-rotation and duplicate tracks
+  },
 };
 
-// Fade duration (seconds) used for crossfades and fade in/out when switching
-// between generated BVH actions and the idle action. Increased from 0.3 to
-// this value to prevent briefly showing the T-pose during resets.
-const FADE_DURATION = 4.0;
-// Additional seconds to keep the character hidden during skeleton reset to
-// ensure the renderer doesn't briefly show the T-pose.
-const HIDE_EXTRA_SECONDS = 2.0;
+const FADE_DURATION = 1.2; // cross-fade between actions (shorter to reduce double-posing)
+const HIDE_EXTRA_SECONDS = 0.0; // no extra delay while hidden
+const OPACITY_FADE_BVH = 0.0; // keep 0 to avoid ghosting; set to ~0.1 for a subtle fade if desired
 
 export class BVHAnimationPlayer {
   private bvhLoader: BVHLoader;
-  private retargetOptions: RetargetOptions | undefined;
+  
+  // --- NEW PROPERTIES FOR PROCEDURAL ANIMATION ---
+  private clock: THREE.Clock = new THREE.Clock();
+  private headBone: THREE.Bone | null = null;
+  private leftShoulder: THREE.Bone | null = null;
+  private rightShoulder: THREE.Bone | null = null;
+  private bonesFound = false; // Flag to ensure we only search for bones once
+
 
   constructor() {
     this.bvhLoader = new BVHLoader();
   }
+
+  // =======================================================================
+  // === NEW PUBLIC METHOD for Procedural Head Motion ===
+  // =======================================================================
+  /**
+   * Call this method in your main animation loop, AFTER `mixer.update(delta)`.
+   * It applies procedural animation to the character's head to make it look
+   * more natural and less stiff, overriding or augmenting the base BVH animation.
+   * @param delta - The time delta since the last frame, from your main clock.
+   */
+  public update(delta: number): void {
+      if (this.headBone) {
+          const elapsedTime = this.clock.getElapsedTime();
+
+          // --- Parameters to control the head motion ---
+          const swayFrequency = 0.5; // Side-to-side tilt frequency
+          const swayAmplitude = 0.04; // Side-to-side tilt amount
+          const nodFrequency = 0.4;  // Up-down nod frequency
+          const nodAmplitude = 0.03;  // Up-down nod amount
+          
+          // Base angle (0 = straight, negative = chin down, positive = chin up)
+          const baseHeadXRotation = -2;
+
+          // 1. SET the up/down rotation directly (overrides the animation).
+          // This forces the head to a base angle plus a procedural nod.
+          this.headBone.rotation.x = baseHeadXRotation + (Math.sin(elapsedTime * nodFrequency) * nodAmplitude);
+
+          // 2. ADD to the side-to-side tilt (layers on top of the animation).
+          // We take the animation's Z-rotation for this frame and add a little extra sway.
+          // The `delta` multiplication makes the sway speed-independent of the frame rate.
+          this.headBone.rotation.z += Math.sin(elapsedTime * swayFrequency) * swayAmplitude * delta;
+      }
+  }
+
 
   /**
    * Fade all mesh materials on an object to target opacity over duration (s).
@@ -50,7 +114,7 @@ export class BVHAnimationPlayer {
             const mats = Array.isArray(child.material) ? child.material : [child.material];
             mats.forEach((m: any) => {
               if (m && typeof m.opacity === 'number') {
-                m.transparent = true;
+                m.transparent = targetOpacity < 1;
                 m.opacity = targetOpacity;
                 m.needsUpdate = true;
               }
@@ -80,6 +144,8 @@ export class BVHAnimationPlayer {
         const t = Math.min(1, (now - startTime) / (duration * 1000));
         materials.forEach(({ mat, start }) => {
           mat.opacity = start + (targetOpacity - start) * t;
+          // When fully opaque, disable transparency to avoid see-through ghosting
+          mat.transparent = mat.opacity < 0.999;
           mat.needsUpdate = true;
         });
         if (t < 1) requestAnimationFrame(tick);
@@ -111,10 +177,8 @@ export class BVHAnimationPlayer {
    */
   private createRetargetOptions(targetMesh: THREE.SkinnedMesh): RetargetOptions {
     console.log("Creating retargeting options for RPM model...");
-    return {
-      ...RPM_TPOSE_RETARGET_OPTIONS,
-      bindTransforms: [], // Provide an empty array for RPM models
-    };
+    // For RPM models, bindTransforms are not needed for this retargeting method
+    return RPM_TPOSE_RETARGET_OPTIONS;
   }
 
   /**
@@ -187,35 +251,42 @@ export class BVHAnimationPlayer {
       return;
     }
 
-    try {
+    // --- NEW: Find bones for adjustments and procedural animation (runs only once) ---
+    if (!this.bonesFound && model) {
+        this.headBone = model.getObjectByName('Head') as THREE.Bone;
+        this.leftShoulder = model.getObjectByName('LeftShoulder') as THREE.Bone;
+        this.rightShoulder = model.getObjectByName('RightShoulder') as THREE.Bone;
+        this.bonesFound = true; // Mark as found so we don't search again
+
+        if (this.headBone) {
+            console.log("✅ Head bone found for procedural animation.");
+        } else {
+            console.warn("⚠️ Could not find 'Head' bone. Head correction will be disabled.");
+        }
+        
+    if (this.leftShoulder && this.rightShoulder) {
+      console.log("✅ Shoulder bones found.");
+      // Removed shoulder width scaling to avoid arm deformation
+    } else {
+            console.warn("⚠️ Could not find LeftShoulder/RightShoulder bones for adjustment.");
+        }
+    }
+
+
+  try {
       const targetSkinnedMesh = model.getObjectByProperty("isSkinnedMesh", true) as THREE.SkinnedMesh;
       if (!targetSkinnedMesh) {
           throw new Error("No skinned mesh found in the model");
       }
 
-  // 1. Clean Reset: fade the model out, stop all actions and reset the
-  // skeleton to its bind pose while hidden to avoid showing the T-pose.
+  // 1. Clean Reset: fade the model out (without removing from scene),
+  // stop all actions and reset the skeleton to its bind pose while hidden.
   const rootObj = targetSkinnedMesh.parent || targetSkinnedMesh;
-  // Strong-hide: detach the character root from the scene graph so it cannot be rendered
-  const parent = rootObj.parent;
-  let reattachIndex: number | null = null;
-  if (parent) {
-    // remember index so we can reinsert near the original spot if desired
-    reattachIndex = parent.children.indexOf(rootObj);
-    parent.remove(rootObj);
-  } else {
-    // Fallback to visibility hide if no parent (should be rare)
-    this.setObjectVisibility(rootObj, false);
-  }
-
-  // Ensure the renderer had a frame with the object removed/hidden
+  await this.fadeObjectOpacity(rootObj, 0, 0);
   await this.waitForNextFrame();
-  await this.sleep(HIDE_EXTRA_SECONDS * 1000);
 
   mixer.stopAllAction();
-  // Force skeleton to bind pose while the object is detached/hidden
   targetSkinnedMesh.skeleton.pose();
-  // Give one frame for the renderer to process the updated skeleton state (still not attached)
   await this.waitForNextFrame();
 
       // 2. Load all BVH files from the provided URLs.
@@ -224,73 +295,81 @@ export class BVHAnimationPlayer {
           throw new Error("No BVH clips were loaded from the provided URLs.");
       }
 
+      const retargetOptions = this.createRetargetOptions(targetSkinnedMesh);
+
       // 3. Retarget each BVH clip to the now-reset model's skeleton.
       const sequenceActions = clips.map((bvh) => {
-          // Now this retargeting will be performed on a clean, neutral skeleton.
-          const retargetedClip = SkeletonUtils.retargetClip(
-              targetSkinnedMesh,
-              bvh.skeleton,
-              bvh.clip,
-              RPM_TPOSE_RETARGET_OPTIONS 
-          );
-          const action = mixer.clipAction(retargetedClip);
-          action.setLoop(THREE.LoopOnce, 1);
-          action.clampWhenFinished = true;
-          return action;
+        const retargetedClip = SkeletonUtils.retargetClip(
+          targetSkinnedMesh,
+          bvh.skeleton,
+          bvh.clip,
+          retargetOptions
+        );
+        // Drop duplicate wrist quaternion tracks to avoid sudden flips
+        const seenQuat = new Set<string>();
+        const filteredTracks: THREE.KeyframeTrack[] = [];
+        for (const track of retargetedClip.tracks) {
+          // Optionally drop root position tracks if needed (commented)
+          // if (track.name === 'Hips.position') continue;
+          if (
+            track.name.endsWith('.quaternion') &&
+            (track.name.startsWith('LeftHand.') || track.name.startsWith('RightHand.'))
+          ) {
+            if (seenQuat.has(track.name)) continue;
+            seenQuat.add(track.name);
+          }
+          filteredTracks.push(track);
+        }
+        (retargetedClip as any).tracks = filteredTracks;
+
+        const action = mixer.clipAction(retargetedClip);
+        action.setLoop(THREE.LoopOnce, 1);
+        action.clampWhenFinished = true;
+        return action;
       });
       
       if (sequenceActions.length === 0) {
           throw new Error("Failed to create any animation actions from the BVH clips.");
       }
 
-      // 4. Play the sequence, fading from one action to the next.
-      let currentActionIndex = 0;
-      const onActionFinished = (e: any) => {
-          if (!sequenceActions.includes(e.action) || e.action !== sequenceActions[currentActionIndex]) {
-              return;
-          }
-
+      // 4. Play the sequence, fading from one action to the next, and resolve when done.
+      await new Promise<void>((resolve) => {
+        let currentActionIndex = 0;
+        const onActionFinished = (e: any) => {
+          if (!sequenceActions.includes(e.action) || e.action !== sequenceActions[currentActionIndex]) return;
           currentActionIndex++;
-
           if (currentActionIndex < sequenceActions.length) {
-              const lastAction = sequenceActions[currentActionIndex - 1];
-              const nextAction = sequenceActions[currentActionIndex];
-              lastAction.crossFadeTo(nextAction, FADE_DURATION, true);
-              nextAction.play();
+            const lastAction = sequenceActions[currentActionIndex - 1];
+            const nextAction = sequenceActions[currentActionIndex];
+            try { lastAction.crossFadeTo(nextAction, FADE_DURATION, true); } catch {}
+            try { nextAction.play(); } catch {}
           } else {
-              // 5. When the sequence is done, fade back to the idle animation.
-              mixer.removeEventListener("finished", onActionFinished);
-              sequenceActions[sequenceActions.length - 1].fadeOut(FADE_DURATION);
-              idleAction.reset().fadeIn(FADE_DURATION).play();
+            // Sequence complete: fade to idle and resolve.
+            try { mixer.removeEventListener('finished', onActionFinished); } catch {}
+            try { sequenceActions[sequenceActions.length - 1].fadeOut(FADE_DURATION); } catch {}
+            try { idleAction.reset().fadeIn(FADE_DURATION).play(); } catch {}
+            resolve();
           }
-      };
+        };
+        try { mixer.addEventListener('finished', onActionFinished); } catch {}
 
-      mixer.addEventListener("finished", onActionFinished);
-
-  // 6. Fade the model back in, then start the sequence by fading out idle
-  // and playing the first BVH action.
-  // Reattach the object to the scene (or show it) and perform a smooth fade-in
-  if (parent) {
-    // re-add to the parent. Three.js will append; exact order usually doesn't matter for rendering.
-    parent.add(rootObj);
-    (rootObj as any).updateMatrixWorld?.(true);
-  } else {
-    this.setObjectVisibility(rootObj, true);
-  }
-
-  // Ensure materials start at 0 opacity for a smooth reveal
-  await this.fadeObjectOpacity(rootObj, 0, 0);
-  await this.fadeObjectOpacity(rootObj, 1, FADE_DURATION);
-  idleAction.fadeOut(FADE_DURATION);
-  sequenceActions[0].play();
-
+        // 6. Fade the model back in, then start the sequence (keep it in the scene).
+        this.fadeObjectOpacity(rootObj, 0, 0)
+          .then(() => this.fadeObjectOpacity(rootObj, 1, OPACITY_FADE_BVH))
+          .then(() => {
+            try { idleAction.fadeOut(FADE_DURATION); } catch {}
+            try { sequenceActions[0].play(); } catch {}
+          })
+          .catch(() => {
+            // Even if fade fails, start the sequence to avoid hanging
+            try { idleAction.fadeOut(FADE_DURATION); } catch {}
+            try { sequenceActions[0].play(); } catch {}
+          });
+      });
     } catch (error) {
       console.error("Error playing BVH sequence:", error);
-      // Ensure we return to a stable state (idle) on error.
-      if (idleAction) {
-        mixer.stopAllAction();
-  idleAction.reset().fadeIn(FADE_DURATION).play();
-      }
+      try { mixer.stopAllAction(); } catch {}
+      try { idleAction.reset().fadeIn(FADE_DURATION).play(); } catch {}
     }
   }
 }

@@ -3,6 +3,7 @@
 import { useState, useRef, useMemo } from 'react';
 import styles from './page.module.css';
 import ThreeCanvas, { type ThreeCanvasHandles } from './components/ThreeCanvas';
+import { bvhPlayer } from './components/BVHAnimationPlayer';
 
 // This map translates Rhubarb's output to your specific model's viseme names.
 export type RhubarbVisemeKey = 'X' | 'A' | 'B' | 'C' | 'D' | 'E' | 'F' | 'G' | 'H';
@@ -89,6 +90,10 @@ type RawVisemeCue = { start: number; end: number; value: RhubarbVisemeKey };
 
 
 export default function Home() {
+  const sanitizeDisplay = (text: string | null | undefined) => {
+    if (!text) return '';
+    return String(text).replace(/\[[^\]]*\]/g, '').replace(/\{[^\}]*\}/g, '').replace(/\s+/g, ' ').trim();
+  };
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   // Ensure the selected character key defaults to a real key from the map
   const defaultCharKey = (Object.keys(characters)[0] || 'Musician') as CharacterKey;
@@ -101,6 +106,10 @@ export default function Home() {
   const [isTestingLipSync, setIsTestingLipSync] = useState(false);
     const [isTestingBVH, setIsTestingBVH] = useState(false);
     const canvasRef = useRef<ThreeCanvasHandles>(null);
+    // Manifest/polling refs for incremental steps
+    const manifestRequestIdRef = useRef<string | null>(null);
+    const manifestCancelRef = useRef<(() => void) | null>(null);
+    const playedStepIndexRef = useRef<number>(0);
   const typingTimerRef = useRef<number | null>(null);
   const hadContentRef = useRef<boolean>(false);
   // If backend returns a generated background image (base64), store it here as a data URL
@@ -246,6 +255,9 @@ export default function Home() {
         background_image,
         background_image_base64,
         background_imageBase64,
+        generation_status,
+        request_id,
+        steps,
       } = result;
 
 
@@ -268,11 +280,30 @@ export default function Home() {
          }
       }
 
-      // STEP 2: Now that the scene is set, process and display the message.
-      const visible = String(answer).replace(/\[[^\]]*\]/g, '').replace(/\s+/g, ' ').trim();
-      setMessages(prev => [...prev, { role: 'assistant', text: visible }]);
+      // STEP 2: Now that the scene is set, decide flow.
+      // If the backend is using the new audio-first manifest flow, defer showing
+      // the full response: we'll append per-step messages when polling the manifest.
+      const visible = String(answer || '')
+        .replace(/\[[^\]]*\]/g, '')
+        .replace(/\{[^\}]*\}/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      
+      // Check if this is actually a manifest flow (has generation_status, request_id AND steps)
+      // vs a single response that might have these fields but no actual steps
+      const isManifestFlow = generation_status && request_id && Array.isArray(steps) && steps.length > 0;
+      
+      if (!isManifestFlow) {
+        // Single response: show message immediately
+        setMessages(prev => [...prev, { role: 'assistant', text: visible }]);
+      } else {
+        // True manifest flow: mark request id and do NOT append full text now
+        manifestRequestIdRef.current = String(request_id);
+        playedStepIndexRef.current = 0;
+        // If the companion included immediate step audio/text (step 0), play it now below
+      }
 
-      // Process assets for playback
+  // Process assets for playback (immediate assets for step-1)
       let processedVisemes: Array<{ time: number; value: string; jaw: number }> | null = null;
       let audioDataUri: string | null = null;
       if (audio_base64 && rawVisemeCues && Array.isArray(rawVisemeCues)) {
@@ -291,31 +322,60 @@ export default function Home() {
         ? bvhFileNames.map((fileName: string) => `${BACKEND_URL}/generated_bvh/${fileName}`)
         : [];
 
-      // STEP 3: Play speech and animations sequentially.
+      // STEP 3: Play immediate speech/BVH for step-1 if present, otherwise start polling
       if (canvasRef.current) {
-        // Play speech (and parallel gestures)
-        if (audioDataUri && processedVisemes) {
-          const speech = canvasRef.current.playAudioWithEmotionAndLipSync(
-            audioDataUri,
-            processedVisemes,
-            emotion || 'neutral'
-          );
-
-          if (mixamo_animation && canvasRef.current.playGestures) {
+        // If we're in true manifest flow and companion provided immediate audio for step-1, play it
+        if (isManifestFlow && generation_status === 'partial' && request_id) {
+          if (audioDataUri && processedVisemes) {
             try {
-              const urls = Array.isArray(mixamo_animation) ? mixamo_animation : [mixamo_animation];
-              const converted = urls.map((p: string) => (p.startsWith('/') ? p : `/gesturesanimation/${p}`));
-              canvasRef.current.playGestures(converted).catch((e) => console.warn(e));
-            } catch (e) {
-              console.warn('Failed to start gestures', e);
-            }
+              await canvasRef.current.playAudioWithEmotionAndLipSync(audioDataUri, processedVisemes, emotion || 'neutral');
+            } catch (e) { console.warn('Immediate manifest audio play failed', e); }
           }
-          await speech; // Wait for speech to complete
-        }
+          if (bvhUrls.length > 0) {
+            try {
+              // Play BVHs sequentially using the canvas method (mirrors working snippet behavior)
+              for (const u of bvhUrls) {
+                await canvasRef.current?.playAnimation(u);
+              }
+            } catch (e) { console.warn('Immediate manifest BVH play failed', e); }
+            // After BVH finishes, ensure the model returns to idle pose
+            try { canvasRef.current?.resetToIdle?.(); } catch (e) {}
+          }
+          
+          // CRITICAL FIX: Mark step 1 as already played to prevent double playback
+          playedStepIndexRef.current = 1;
+          
+          // Start polling the manifest for subsequent steps (will start from step 2)
+          if (manifestCancelRef.current) {
+            manifestCancelRef.current();
+          }
+          manifestCancelRef.current = startManifestPolling(String(request_id));
+        } else {
+          // Single-response flow: play speech then BVH as before
+          if (audioDataUri && processedVisemes) {
+            const speech = canvasRef.current.playAudioWithEmotionAndLipSync(
+              audioDataUri,
+              processedVisemes,
+              emotion || 'neutral'
+            );
 
-        // After speech, play the main body motion
-        if (bvhUrls.length > 0) {
-          await canvasRef.current.playAnimation(bvhUrls[0]);
+            if (mixamo_animation && canvasRef.current.playGestures) {
+              try {
+                const urls = Array.isArray(mixamo_animation) ? mixamo_animation : [mixamo_animation];
+                const converted = urls.map((p: string) => (p.startsWith('/') ? p : `/gesturesanimation/${p}`));
+                canvasRef.current.playGestures(converted).catch((e) => console.warn(e));
+              } catch (e) {
+                console.warn('Failed to start gestures', e);
+              }
+            }
+            await speech; // Wait for speech to complete
+          }
+
+          // After speech, play the main body motion
+          if (bvhUrls.length > 0) {
+            await canvasRef.current.playAnimation(bvhUrls[0]);
+            try { canvasRef.current?.resetToIdle?.(); } catch (e) {}
+          }
         }
       }
 
@@ -326,6 +386,87 @@ export default function Home() {
     } finally {
       setIsSending(false);
     }
+  };
+
+  // Helper: start manifest polling for stepwise playback. Returns cancel function.
+  const startManifestPolling = (requestId: string) => {
+    let cancelled = false;
+    let playedIndex = playedStepIndexRef.current || 0;
+    let emptyPolls = 0;
+    const pollInterval = 1000;
+
+    const mapRhCuesToVisemes = (raw: any[]) => (raw || []).map((cue: any) => {
+      const entry = rhubarbToVisemeMap[(cue.value as RhubarbVisemeKey) || 'X'] || rhubarbToVisemeMap['X'];
+      return { time: cue.start, value: entry.viseme, jaw: entry.jaw };
+    });
+
+    const poll = async () => {
+      if (cancelled) return;
+      try {
+        const res = await fetch(`${BACKEND_URL}/api/companion/status/${requestId}`);
+        if (!res.ok) throw new Error(`manifest fetch failed: ${res.status}`);
+        const manifest = await res.json();
+        const stepsList = manifest.steps || [];
+
+        for (let i = playedIndex; i < stepsList.length; i++) {
+          if (cancelled) return;
+          const step = stepsList[i];
+          // show step text then play audio then bvh
+          const stepText = String(step.step || '').replace(/\[[^\]]*\]/g, '').replace(/\s+/g, ' ').trim();
+          if (stepText) setMessages(prev => [...prev, { role: 'assistant', text: stepText }]);
+
+          if (step.audio_base64) {
+            try {
+              const audioUri = `data:audio/mp3;base64,${step.audio_base64}`;
+              const mapped = mapRhCuesToVisemes(step.visemes || []);
+              await canvasRef.current?.playAudioWithEmotionAndLipSync?.(audioUri, mapped, manifest.emotion || 'neutral');
+            } catch (e) { console.warn('manifest step audio failed', e); }
+          } else if (step.step) {
+            // fallback to /ask
+            try {
+              const askRes = await fetch(`${BACKEND_URL}/ask`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ text: step.step, character: selectedCharKey }) });
+              if (askRes.ok) {
+                const askJson = await askRes.json();
+                if (askJson.audio_base64) {
+                  const audioUri = `data:audio/mp3;base64,${askJson.audio_base64}`;
+                  const mapped = mapRhCuesToVisemes(askJson.visemes || []);
+                  await canvasRef.current?.playAudioWithEmotionAndLipSync?.(audioUri, mapped, askJson.emotion || 'neutral');
+                }
+              }
+            } catch (e) { console.warn('manifest step /ask fallback failed', e); }
+          }
+
+            if (Array.isArray(step.bvh_files) && step.bvh_files.length > 0) {
+            const urls = step.bvh_files.map((f: string) => `${BACKEND_URL}/generated_bvh/${f}`);
+            try {
+              // Play each BVH sequentially using the simple, natural approach
+              for (const url of urls) {
+                await canvasRef.current?.playAnimation(url);
+              }
+            } catch (e) { console.warn('manifest step BVH play failed', e); }
+            // Reset to idle after BVH sequence completes
+            try { canvasRef.current?.resetToIdle?.(); } catch (e) {}
+          }
+
+          playedIndex = i + 1;
+          playedStepIndexRef.current = playedIndex;
+        }
+
+        if (manifest.complete && playedIndex >= (manifest.steps || []).length) {
+          return; // finished
+        }
+
+        if ((stepsList.length === playedIndex) || stepsList.length === 0) emptyPolls++; else emptyPolls = 0;
+        const next = emptyPolls > 6 ? Math.min(5000, pollInterval * 3) : pollInterval;
+        if (!cancelled) setTimeout(poll, next);
+      } catch (err) {
+        console.warn('manifest poll error', err);
+        if (!cancelled) setTimeout(poll, 3000);
+      }
+    };
+
+    poll();
+    return () => { cancelled = true; };
   };
 
   const handleTestLipSync = async () => {
@@ -368,12 +509,12 @@ export default function Home() {
 canvasRef.current.playAudioWithEmotionAndLipSync(audioDataUri, visemes, 'neutral');
 
 
-  setMessages(prev => [...prev, { role: 'assistant', text: 'Static lip-sync test complete.' }]);
+  setMessages(prev => [...prev, { role: 'assistant', text: sanitizeDisplay('Static lip-sync test complete.') }]);
 
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : "An unknown error occurred.";
       console.error("Lip-sync test failed:", error);
-  setMessages(prev => [...prev, { role: 'assistant', text: `Error in test: ${errorMessage}` }]);
+  setMessages(prev => [...prev, { role: 'assistant', text: sanitizeDisplay(`Error in test: ${errorMessage}`) }]);
     } finally {
       setIsSending(false);
       setIsTestingLipSync(false);
@@ -389,13 +530,13 @@ canvasRef.current.playAudioWithEmotionAndLipSync(audioDataUri, visemes, 'neutral
         setChatResponse('Canvas not ready.');
         return;
       }
-  setMessages(prev => [...prev, { role: 'assistant', text: 'Loading BVH...' }]);
+  setMessages(prev => [...prev, { role: 'assistant', text: sanitizeDisplay('Loading BVH...') }]);
       const testBvhUrl = `${BACKEND_URL}/generated_bvh/A_person_runs.bvh`;
       await canvasRef.current.playAnimation(testBvhUrl);
-  setMessages(prev => [...prev, { role: 'assistant', text: 'BVH played.' }]);
+  setMessages(prev => [...prev, { role: 'assistant', text: sanitizeDisplay('BVH played.') }]);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-  setMessages(prev => [...prev, { role: 'assistant', text: `BVH test failed: ${msg}` }]);
+  setMessages(prev => [...prev, { role: 'assistant', text: sanitizeDisplay(`BVH test failed: ${msg}`) }]);
     } finally {
       setIsTestingBVH(false);
     }
