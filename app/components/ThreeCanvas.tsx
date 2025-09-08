@@ -371,6 +371,39 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
       },
     };
 
+     const tweenCamera = (
+      endPos: THREE.Vector3,
+      endTarget: THREE.Vector3,
+      duration: number
+    ): Promise<void> => {
+      return new Promise((resolve) => {
+        const camera = cameraRef.current;
+        const controls = controlsRef.current;
+        if (!camera || !controls) return resolve();
+
+        const startPos = camera.position.clone();
+        const startTarget = controls.target.clone();
+        const startTime = performance.now();
+
+        const tick = () => {
+          const elapsedTime = performance.now() - startTime;
+          const progress = Math.min(elapsedTime / duration, 1);
+          // Use an ease-in-out function for a smoother feel
+          const easedProgress = 0.5 - 0.5 * Math.cos(progress * Math.PI);
+
+          camera.position.lerpVectors(startPos, endPos, easedProgress);
+          controls.target.lerpVectors(startTarget, endTarget, easedProgress);
+
+          if (progress < 1) {
+            requestAnimationFrame(tick);
+          } else {
+            resolve();
+          }
+        };
+        requestAnimationFrame(tick);
+      });
+    };
+
     // Helper: find the primary SkinnedMesh (with the largest number of bones)
     const findBestSkinnedMesh = (root: THREE.Object3D): THREE.SkinnedMesh | null => {
       let best: THREE.SkinnedMesh | null = null;
@@ -383,6 +416,92 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
       });
       return best;
     };
+
+  const findPelvisBone = (mesh: THREE.SkinnedMesh): THREE.Bone | null => {
+    if (!mesh?.skeleton) return null;
+    const candidates = mesh.skeleton.bones;
+    const preferred = [
+      /^Hips$/i,
+      /mixamorig[:]?Hips/i,
+      /Pelvis/i,
+      /Root$/i,
+      /Spine$/i,
+    ];
+    for (const pattern of preferred) {
+      const bone = candidates.find((b) => pattern.test(b.name));
+      if (bone) return bone;
+    }
+    // Fallback to the shortest-named bone near root
+    const sorted = [...candidates].sort((a, b) => a.name.length - b.name.length);
+    return sorted[0] || null;
+  };
+
+  // NEW: Camera follow mode helpers
+const startFollowing = () => {
+  const camera = cameraRef.current;
+  const controls = controlsRef.current;
+  const anchor = followAnchorRef.current;
+
+  if (!camera || !controls || !anchor) {
+    console.warn("Follow mode cannot start: dependencies missing.");
+    return;
+  }
+
+  // Store original controls state to restore it later
+  prevControlsStateRef.current = {
+    enablePan: controls.enablePan,
+    enableRotate: controls.enableRotate,
+    enableDamping: controls.enableDamping,
+    dampingFactor: controls.dampingFactor,
+  };
+
+  // Get the anchor's current world position
+  anchor.updateMatrixWorld(true);
+  const anchorPos = new THREE.Vector3();
+  anchor.getWorldPosition(anchorPos);
+
+  // Read the desired view from our new configuration ref
+  const { distance, height, side } = followViewRef.current;
+
+  // Calculate the desired position for the camera and its target
+  const desiredCamPos = new THREE.Vector3(
+    anchorPos.x + side,
+    anchorPos.y + height,
+    anchorPos.z + distance
+  );
+  // The point the camera will look at. We aim it slightly lower than the camera's height.
+  const desiredTargetPos = new THREE.Vector3(
+    anchorPos.x,
+    anchorPos.y + (height * 0.9),
+    anchorPos.z
+  );
+
+  // Calculate and store the offsets from the anchor's position.
+  // The animate() loop will use these offsets to keep the camera in place.
+  cameraOffsetRef.current.copy(desiredCamPos).sub(anchorPos);
+  controlsOffsetRef.current.copy(desiredTargetPos).sub(anchorPos);
+
+  // Disable user panning during follow mode for a smoother experience
+  controls.enablePan = false;
+  controls.enableDamping = true;
+
+  isFollowingRef.current = true;
+  console.log("BVH camera follow: Started with custom view.");
+};
+
+  const stopFollowing = () => {
+    if (!isFollowingRef.current) return;
+    isFollowingRef.current = false;
+
+    const controls = controlsRef.current;
+    
+    // Restore original controls state
+    if (controls && prevControlsStateRef.current) {
+      Object.assign(controls, prevControlsStateRef.current);
+      prevControlsStateRef.current = null;
+    }
+    console.log("BVH camera follow: Stopped.");
+  };
 
     const targetVisemeWeights = useRef<{ [key: string]: number }>({}).current;
     const targetJawOpen = useRef(0);
@@ -509,9 +628,9 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
     const controlsStartTargetRef = useRef(new THREE.Vector3());
     const cameraOffsetRef = useRef(new THREE.Vector3());
     const controlsOffsetRef = useRef(new THREE.Vector3());
-  // Last known good finite camera transform (for recovering from NaN/Infinity)
-  const lastGoodCameraPosRef = useRef(new THREE.Vector3(0, 1, 3));
-  const lastGoodCameraQuatRef = useRef(new THREE.Quaternion());
+    // Last known good finite camera transform (for recovering from NaN/Infinity)
+    const lastGoodCameraPosRef = useRef(new THREE.Vector3(0, 1, 3));
+    const lastGoodCameraQuatRef = useRef(new THREE.Quaternion());
     const modelRootRef = useRef<THREE.Object3D | null>(null);
     const modelStartPosRef = useRef(new THREE.Vector3());
     const modelStartQuatRef = useRef(new THREE.Quaternion());
@@ -523,10 +642,16 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
       enableDamping: boolean;
       dampingFactor: number;
     } | null>(null);
+     const cameraRestorePosRef = useRef<THREE.Vector3 | null>(null);
+    const cameraRestoreTargetRef = useRef<THREE.Vector3 | null>(null);
   // Desired front-view camera settings during follow (tweak to taste)
   // Use a small distance and zero side to stay centered and closer to the character.
   // Lowered height so follow view isn't too high above the character.
-  const followViewRef = useRef({ distance: 3, height: 1, side: 1.5 });
+  const followViewRef = useRef({ 
+    distance: 3.0, // How far back the camera is.
+    height: 1.0,   // How high the camera is.
+    side: 1.5      // How far to the character's side (positive = right, negative = left).
+});
 
       const playAudioWithEmotionAndLipSync = async (
       audioUrl: string,
@@ -728,26 +853,6 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
         );
       } catch {}
       return clip;
-    };
-
-    // Try to find a pelvis/hips bone on the target model for camera follow
-    const findPelvisBone = (mesh: THREE.SkinnedMesh): THREE.Bone | null => {
-      if (!mesh?.skeleton) return null;
-      const candidates = mesh.skeleton.bones;
-      const preferred = [
-        /^Hips$/i,
-        /mixamorig[:]?Hips/i,
-        /Pelvis/i,
-        /Root$/i,
-        /Spine$/i,
-      ];
-      for (const pattern of preferred) {
-        const bone = candidates.find((b) => pattern.test(b.name));
-        if (bone) return bone;
-      }
-      // Fallback to the shortest-named bone near root
-      const sorted = [...candidates].sort((a, b) => a.name.length - b.name.length);
-      return sorted[0] || null;
     };
 
     // Smoothly fade all mesh materials' opacity on an object
@@ -1073,10 +1178,21 @@ const processMixamoQueue = async () => {
         const mixer = mixerRef.current;
         const idleAction = idleActionRef.current;
         const bodyMesh = bodyMeshRef.current;
-        if (!mixer || !idleAction || !bodyMesh) {
+        const camera = cameraRef.current;
+        const controls = controlsRef.current;
+
+        if (!mixer || !idleAction || !bodyMesh || !camera || !controls) {
+          console.error("Animation prerequisites not ready.");
           return Promise.resolve();
         }
+
         return new Promise((resolve, reject) => {
+          // --- 1. SAVE the current camera position ---
+          if (!cameraRestorePosRef.current) {
+            cameraRestorePosRef.current = camera.position.clone();
+            cameraRestoreTargetRef.current = controls.target.clone();
+          }
+
           const bvhLoader = new BVHLoader();
           bvhLoader.load(
             url,
@@ -1084,57 +1200,53 @@ const processMixamoQueue = async () => {
               if (!bvh.clip) {
                 return reject(new Error("BVH file has no animation data"));
               }
-
-              console.log("✅ BVH Animation loaded:", url);
               
-              // Simple retarget exactly like the working HTML example
               const options = {
                 hip: 'Hips',
                 names: {
-                  'Spine': 'Spine',
-                  'Spine1': 'Spine1', 
-                  'Spine2': 'Spine2',
-                  'Neck': 'Neck',
-                  'Head': 'Head',
-                  'LeftShoulder': 'LeftShoulder',
-                  'LeftArm': 'LeftArm',
-                  'LeftForeArm': 'LeftForeArm', 
-                  'LeftHand': 'LeftHand',
-                  'RightShoulder': 'RightShoulder',
-                  'RightArm': 'RightArm',
-                  'RightForeArm': 'RightForeArm',
-                  'RightHand': 'RightHand',
-                  'LeftUpLeg': 'LeftUpLeg',
-                  'LeftLeg': 'LeftLeg',
-                  'LeftFoot': 'LeftFoot',
-                  'LeftToe': 'LeftToeBase',
-                  'RightUpLeg': 'RightUpLeg', 
-                  'RightLeg': 'RightLeg',
-                  'RightFoot': 'RightFoot',
-                  'RightToe': 'RightToeBase'
+                  'Spine': 'Spine', 'Spine1': 'Spine1', 'Spine2': 'Spine2', 'Neck': 'Neck', 'Head': 'Head', 'LeftShoulder': 'LeftShoulder', 'LeftArm': 'LeftArm', 'LeftForeArm': 'LeftForeArm', 'LeftHand': 'LeftHand', 'RightShoulder': 'RightShoulder', 'RightArm': 'RightArm', 'RightForeArm': 'RightForeArm', 'RightHand': 'RightHand', 'LeftUpLeg': 'LeftUpLeg', 'LeftLeg': 'LeftLeg', 'LeftFoot': 'LeftFoot', 'LeftToe': 'LeftToeBase', 'RightUpLeg': 'RightUpLeg', 'RightLeg': 'RightLeg', 'RightFoot': 'RightFoot', 'RightToe': 'RightToeBase'
                 }
               };
-
               const retargetedClip = SkeletonUtils.retargetClip(bodyMesh, bvh.skeleton, bvh.clip, options);
               
-              // Store original position and adjust Y during BVH playback
-              const originalPosition = bodyMesh.position.clone();
-              bodyMesh.position.y = originalPosition.y + 0.3; // Lift model slightly during BVH
+              retargetedClip.tracks = retargetedClip.tracks.filter(
+                track => track.name !== 'Hips.position'
+              );
+
+              // --- 2. DEFINE THE "ACTION CAM" VIEW ---
+              const bvhViewPos = camera.position.clone();
+              const bvhViewTarget = controls.target.clone();
               
+              // Move the camera down
+              bvhViewPos.y -= 0.4;
+              bvhViewTarget.y -= 0.4;
+
+              // Move the camera backwards (away from the model)
+              bvhViewPos.z += 1;
+
+              // --- 3. TWEEN to the new position ---
+              tweenCamera(bvhViewPos, bvhViewTarget, 600); 
+
               const action = mixer.clipAction(retargetedClip);
               action.setLoop(THREE.LoopOnce, 1);
               action.clampWhenFinished = true;
               action.play();
-              
-              console.log("✅ Animation retargeted and playing (simple approach like working example).");
 
               const onFinished = (e: any) => {
                 if (e.action === action) {
                   mixer.removeEventListener("finished", onFinished);
+                  
+                  // --- 4. TWEEN BACK to the saved position ---
+                  if (cameraRestorePosRef.current && cameraRestoreTargetRef.current) {
+                    tweenCamera(cameraRestorePosRef.current, cameraRestoreTargetRef.current, 600)
+                      .then(() => {
+                        cameraRestorePosRef.current = null;
+                        cameraRestoreTargetRef.current = null;
+                      });
+                  }
+                  
                   try {
                     action.stop();
-                    // Restore original position after BVH ends
-                    bodyMesh.position.copy(originalPosition);
                     if (idleAction) {
                       idleAction.reset().play();
                     }
@@ -1146,6 +1258,11 @@ const processMixamoQueue = async () => {
             },
             undefined,
             (error) => {
+              if (cameraRestorePosRef.current && cameraRestoreTargetRef.current) {
+                tweenCamera(cameraRestorePosRef.current, cameraRestoreTargetRef.current, 600);
+                cameraRestorePosRef.current = null;
+                cameraRestoreTargetRef.current = null;
+              }
               console.error("Error loading BVH:", error);
               reject(error);
             }
@@ -1252,6 +1369,19 @@ const processMixamoQueue = async () => {
         findBestSkinnedMesh(characterModel) ||
         (characterModel.getObjectByProperty("isSkinnedMesh", true) as THREE.SkinnedMesh);
 
+      bodyMeshRef.current =
+      findBestSkinnedMesh(characterModel) ||
+      (characterModel.getObjectByProperty("isSkinnedMesh", true) as THREE.SkinnedMesh);
+
+    // NEW: Set the anchor point for the follow camera
+    if (bodyMeshRef.current) {
+        followAnchorRef.current = findPelvisBone(bodyMeshRef.current);
+    }
+    // Fallback to the model's root object if no suitable bone is found
+    if (!followAnchorRef.current) {
+        console.warn("Could not find a Hips/Pelvis bone; camera will follow model root.");
+        followAnchorRef.current = characterModel;
+    }
       // Store model root and its starting transform for reset
       modelRootRef.current = characterModel;
       modelStartPosRef.current.copy(characterModel.position);
@@ -1638,6 +1768,7 @@ const processMixamoQueue = async () => {
 
         // Facial morphs: blink, visemes, and emotion
         const faceMesh: any = faceMeshRef.current;
+
         if (faceMesh && faceMesh.morphTargetDictionary && faceMesh.morphTargetInfluences) {
           const lerpA = Math.min(1, delta * LERP_SPEED);
 
@@ -1718,28 +1849,68 @@ const processMixamoQueue = async () => {
         }
 
         // Follow anchor (used during BVH play)
-        if (isFollowingRef.current && followAnchorRef.current) {
-          try {
-            const anchor = followAnchorRef.current;
-            anchor.updateMatrixWorld?.(true);
-            const anchorPos = new THREE.Vector3();
-            const anchorQuat = new THREE.Quaternion();
-            anchor.getWorldPosition(anchorPos);
-            anchor.getWorldQuaternion(anchorQuat);
+       if (isFollowingRef.current && followAnchorRef.current) {
+  try {
+    const anchor = followAnchorRef.current;
+    const camera = cameraRef.current!;
+    const controls = controlsRef.current!;
 
-            const desiredCamPos = new THREE.Vector3().copy(cameraOffsetRef.current).applyQuaternion(anchorQuat).add(anchorPos);
-            if (Number.isFinite(desiredCamPos.x + desiredCamPos.y + desiredCamPos.z)) {
-              camera.position.lerp(desiredCamPos, 0.25);
-              lastGoodCameraPosRef.current.copy(camera.position);
-            } else {
-              camera.position.copy(lastGoodCameraPosRef.current);
-            }
-            const desiredTarget = new THREE.Vector3().copy(controlsOffsetRef.current).add(anchorPos);
-            controls.target.lerp(desiredTarget, 0.3);
-          } catch (e) {
-            // ignore follow errors
-          }
-        }
+    anchor.updateMatrixWorld?.(true);
+    const anchorPos = new THREE.Vector3();
+    const anchorQuat = new THREE.Quaternion();
+    anchor.getWorldPosition(anchorPos);
+    anchor.getWorldQuaternion(anchorQuat); // Get the character's rotation
+
+    // Apply the character's rotation to our camera offset. This is key!
+    const desiredCamPos = new THREE.Vector3().copy(cameraOffsetRef.current).applyQuaternion(anchorQuat).add(anchorPos);
+    
+    if (Number.isFinite(desiredCamPos.x + desiredCamPos.y + desiredCamPos.z)) {
+      // Use a small lerp value for smooth, cinematic tracking
+      camera.position.lerp(desiredCamPos, 0.08); 
+      lastGoodCameraPosRef.current.copy(camera.position);
+    } else {
+      camera.position.copy(lastGoodCameraPosRef.current); // Recover if math goes wrong
+    }
+
+    const desiredTarget = new THREE.Vector3().copy(controlsOffsetRef.current).add(anchorPos);
+    controls.target.lerp(desiredTarget, 0.08);
+
+  } catch (e) {
+    console.warn("Error during camera follow:", e);
+    stopFollowing();
+  }
+}
+
+        if (isFollowingRef.current && followAnchorRef.current) {
+  try {
+    const anchor = followAnchorRef.current;
+    const camera = cameraRef.current!;
+    const controls = controlsRef.current!;
+
+    anchor.updateMatrixWorld(true);
+    const anchorPos = new THREE.Vector3();
+    anchor.getWorldPosition(anchorPos);
+
+    // Calculate the desired camera and target positions based on stored offsets
+    const desiredCamPos = new THREE.Vector3().copy(anchorPos).add(cameraOffsetRef.current);
+    const desiredTargetPos = new THREE.Vector3().copy(anchorPos).add(controlsOffsetRef.current);
+
+    // Smoothly move the camera and its target towards the desired positions
+    if (Number.isFinite(desiredCamPos.x)) {
+        camera.position.lerp(desiredCamPos, 0.1);
+        lastGoodCameraPosRef.current.copy(camera.position);
+    } else {
+        camera.position.copy(lastGoodCameraPosRef.current); // Recover if values are invalid
+    }
+    
+    controls.target.lerp(desiredTargetPos, 0.1);
+
+  } catch (e) {
+    // Stop following on error to prevent breaking the render loop
+    console.error("Error in camera follow logic:", e);
+    stopFollowing();
+  }
+}
 
         try { controls.update(); } catch (e) {}
         // Clear once, then render background (fullscreen quad) then main scene

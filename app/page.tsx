@@ -92,7 +92,14 @@ type RawVisemeCue = { start: number; end: number; value: RhubarbVisemeKey };
 export default function Home() {
   const sanitizeDisplay = (text: string | null | undefined) => {
     if (!text) return '';
-    return String(text).replace(/\[[^\]]*\]/g, '').replace(/\{[^\}]*\}/g, '').replace(/\s+/g, ' ').trim();
+    // Remove square-bracket notes, double-curly action blocks {{...}},
+    // then single braces as a fallback. Use [\s\S] so we match across newlines.
+    return String(text)
+      .replace(/\[[^\]]*\]/g, '')
+      .replace(/\{\{[\s\S]*?\}\}/g, '')
+      .replace(/\{[^\}]*\}/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
   };
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   // Ensure the selected character key defaults to a real key from the map
@@ -283,8 +290,10 @@ export default function Home() {
   // STEP 2: Now that the scene is set, decide flow.
       // If the backend is using the new audio-first manifest flow, defer showing
       // the full response: we'll append per-step messages when polling the manifest.
+      // Prepare visible text for chat by stripping notes and action blocks
       const visible = String(answer || '')
         .replace(/\[[^\]]*\]/g, '')
+        .replace(/\{\{[\s\S]*?\}\}/g, '')
         .replace(/\{[^\}]*\}/g, '')
         .replace(/\s+/g, ' ')
         .trim();
@@ -395,7 +404,7 @@ export default function Home() {
       stepMatches.forEach((stepText, index) => {
         // Clean up the text by removing action descriptions in {{}} and the step number
         const cleanText = stepText
-          .replace(/\{\{.*?\}\}/g, '') // Remove {{action descriptions}}
+          .replace(/\{\{[\s\S]*?\}\}/g, '') // Remove {{action descriptions}} (multi-line safe)
           .replace(/Step\s+\d+:\s*/i, '') // Remove "Step X:"
           .replace(/\s+/g, ' ') // Normalize whitespace
           .trim();
@@ -508,7 +517,12 @@ export default function Home() {
           if (cancelled) return;
           const step = stepsList[i];
           // show step text then play audio then bvh
-          const stepText = String(step.step || '').replace(/\[[^\]]*\]/g, '').replace(/\s+/g, ' ').trim();
+          // Remove square-bracket notes and double-curly action blocks before showing
+          const stepText = String(step.step || '')
+            .replace(/\[[^\]]*\]/g, '')
+            .replace(/\{\{[\s\S]*?\}\}/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
           if (stepText) setMessages(prev => [...prev, { role: 'assistant', text: stepText }]);
 
           if (step.audio_base64) {
