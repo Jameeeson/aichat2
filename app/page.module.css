@@ -194,7 +194,8 @@
   flex-shrink: 0;
 }
 
-.personaName { font-size: 0.95rem; }
+.personaName { font-size: 0.95rem;  white-space: normal;   /* allow line breaks */
+  display: block; }
 
 .personaActive {
   background: rgba(255,255,255,0.06);

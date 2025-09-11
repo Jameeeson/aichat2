@@ -54,6 +54,7 @@ export default function CharacterController() {
   const [isChatVisible, setIsChatVisible] = useState(false);
   const [selectedCharKey, setSelectedCharKey] = useState<CharacterKey>('harry');
   const [selectedBgKey, setSelectedBgKey] = useState<BackgroundKey>('studio');
+  const [emotionTag, setEmotionTag] = useState<string | null>(null);
   
   // Ref to access ThreeCanvas methods
   const canvasRef = useRef<ThreeCanvasHandles>(null);
@@ -89,7 +90,21 @@ export default function CharacterController() {
       const { response: answer } = companionJson;
       if (!answer) throw new Error("Invalid response from companion");
 
-      setChatMessage(answer); // Show the full response at once
+      // If the assistant prepends an emotion tag like "(joyful)" remove it from the displayed text
+      // but keep the tag so the canvas can react (e.g., smile). This prevents duplication in the UI.
+      let displayAnswer = answer;
+      let parsedEmotion: string | null = null;
+      const trimmed = answer.trim();
+      if (trimmed.startsWith('(')) {
+        const closeIdx = trimmed.indexOf(')');
+        if (closeIdx > 1) {
+          parsedEmotion = trimmed.slice(1, closeIdx).trim();
+          displayAnswer = trimmed.slice(closeIdx + 1).trim();
+        }
+      }
+
+      setEmotionTag(parsedEmotion);
+      setChatMessage(displayAnswer); // Show the response without the leading emotion tag
       setStatus('Generating audio...');
 
       // Get audio and visemes (lip-sync data)
@@ -128,6 +143,7 @@ export default function CharacterController() {
         setIsChatVisible(false);
         setStatus('Ready');
         setIsTalking(false);
+        setEmotionTag(null);
       }, 3000);
     }
   };
@@ -255,7 +271,9 @@ export default function CharacterController() {
           introAnimationUrl={selectedCharacter.introAnimationUrl}
           idleAnimationUrl={selectedCharacter.idleAnimationUrl}
           interruptAnimationUrl={selectedCharacter.interruptAnimationUrl}
-          smileIntensity={0.2}
+          // Increase smile intensity when an emotion tag is present; ThreeCanvas can also read `emotion`.
+          smileIntensity={emotionTag ? 0.6 : 0.2}
+          emotion={emotionTag}
           backgroundData={selectedBackground}
         />
       </div>

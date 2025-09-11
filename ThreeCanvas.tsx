@@ -37,6 +37,7 @@ export interface ThreeCanvasProps {
   backgroundData?: BackgroundData;
   backgroundPreset?: keyof typeof backgrounds;
   smileIntensity?: number;
+  emotion?: string | null;
 }
 
 const boneNameMap: { [key: string]: string } = {

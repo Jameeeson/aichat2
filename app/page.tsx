@@ -1,9 +1,9 @@
 'use client';
 
-import { useState, useRef, useMemo } from 'react';
+import { useState, useRef, useMemo, useEffect } from 'react';
 import styles from './page.module.css';
 import ThreeCanvas, { type ThreeCanvasHandles } from './components/ThreeCanvas';
-import { bvhPlayer } from './components/BVHAnimationPlayer';
+import React from 'react';
 
 // This map translates Rhubarb's output to your specific model's viseme names.
 export type RhubarbVisemeKey = 'X' | 'A' | 'B' | 'C' | 'D' | 'E' | 'F' | 'G' | 'H';
@@ -53,6 +53,14 @@ const characters: Record<string, {
     talkingAnimationUrl2: '/talkinganimations/Talking2.fbx',
     gender: 'female',
   },
+  Police: {
+    name: 'Police',
+    modelUrl: '/models/policev2T.glb',
+    typingAnimationUrl: '/idleanimations/waiting.fbx',
+    talkingAnimationUrl1: '/talkinganimations/Talking2.fbx',
+    talkingAnimationUrl2: '/talkinganimations/Talking2.fbx',
+    gender: 'male',
+  },
   Dancer: {
     name: 'Dancer',
     modelUrl: '/models/Surf.glb',
@@ -61,21 +69,13 @@ const characters: Record<string, {
     talkingAnimationUrl2: '/talkinganimations/Talking2.fbx',
     gender: 'female',
   },
-  Police: {
-    name: 'Police',
-    modelUrl: '/models/policev2.glb',
-    typingAnimationUrl: '/idleanimations/waiting.fbx',
-    talkingAnimationUrl1: '/talkinganimations/Talking2.fbx',
-    talkingAnimationUrl2: '/talkinganimations/Talking2.fbx',
-    gender: 'male',
-  },
   Instructor: {
-    name: 'Instructor',
-    modelUrl: '/models/instructor.glb',
+    name: 'Fitness Instructor',
+    modelUrl: '/models/fitnessinstructor.glb',
     typingAnimationUrl: '/idleanimations/waiting.fbx',
     talkingAnimationUrl1: '/talkinganimations/Talking2.fbx',
     talkingAnimationUrl2: '/talkinganimations/Talking2.fbx',
-  },
+  }
 };
 
 const backgrounds = {
@@ -118,10 +118,15 @@ export default function Home() {
     const manifestCancelRef = useRef<(() => void) | null>(null);
     const playedStepIndexRef = useRef<number>(0);
   const typingTimerRef = useRef<number | null>(null);
+  const parsedStepsRef = useRef<string[]>([]);
   const hadContentRef = useRef<boolean>(false);
   // If backend returns a generated background image (base64), store it here as a data URL
   const [customBackgroundUrl, setCustomBackgroundUrl] = useState<string | null>(null);
 
+   useEffect(() => {
+    // This will run every time selectedCharKey changes
+    setMessages([]); 
+  }, [selectedCharKey]);
   // Determine which idle animation to use based on the character's gender.
   // Female characters use the female idle pack, male characters use the male idle pack.
   // Return an array of idle FBX files for the given gender so ThreeCanvas can
@@ -338,18 +343,64 @@ export default function Home() {
         console.log('page.tsx: Available BVH URLs:', bvhUrls);
         await playStepsSequentially(parsedSteps, audioDataUri, processedVisemes, emotion, bvhUrls);
         return; // Exit early to avoid duplicate playback
-      } else if (isLikelyManifest) {
-        // Manifest flow (preferred when request_id exists): start polling and avoid
-        // playing a single early BVH or full response audio which would break sequencing.
-        manifestRequestIdRef.current = String(request_id);
-        playedStepIndexRef.current = 0;
-        if (manifestCancelRef.current) {
-          manifestCancelRef.current();
-        }
-        manifestCancelRef.current = startManifestPolling(String(request_id));
-        // Defer UI text display to polling (per-step). Avoid further immediate playback.
-        return;
-      }
+} else if (isLikelyManifest) {
+  // Manifest flow for multi-part responses.
+
+  // --- START OF MODIFICATIONS ---
+
+  // 1. Parse the full response into individual step texts.
+  // This regex splits the text by "Step X:" while keeping the delimiter.
+let stepsOnlyText = visible;
+const step1Marker = "Step 1:";
+const step1Index = visible.indexOf(step1Marker);
+
+if (step1Index > -1) {
+  // If "Step 1:" is found, slice the string to start exactly from there.
+  stepsOnlyText = visible.substring(step1Index);
+}
+
+// Now, split the cleaned text block into an array of individual steps.
+const parsedSteps = stepsOnlyText
+  .split(/(?=Step\s+\d+:)/) // Split before each "Step X:", keeping the delimiter.
+  .map(p => p.trim())      // Trim whitespace from each step.
+  .filter(Boolean);          // Remove any potential empty strings.
+
+parsedStepsRef.current = parsedSteps; // Store all parsed steps in the ref.
+
+// 2. Display only the first step from our clean array.
+const initialText = parsedSteps[0] || visible; // Use the first parsed step, with a fallback.
+if (initialText) {
+  setMessages(prev => [...prev, { role: 'assistant', text: initialText }]);
+}
+  // 2. Play the initial audio if it was sent in the first response.
+  if (audioDataUri && processedVisemes && canvasRef.current) {
+    await canvasRef.current.playAudioWithEmotionAndLipSync(
+      audioDataUri,
+      processedVisemes,
+      emotion || 'neutral'
+    );
+  }
+  
+  // 3. (FIX) Play the BVH for the first step IF it was sent in the initial response.
+  if (bvhUrls.length > 0 && canvasRef.current) {
+    // We assume the first BVH in the list corresponds to the first step/introductory action.
+    console.log("Playing initial BVH from first response:", bvhUrls[0]);
+    await canvasRef.current.playAnimation(bvhUrls[0]);
+  }
+  
+  // 4. Now, start polling for any subsequent steps (like the BVH animation).
+  manifestRequestIdRef.current = String(request_id);
+  // Start polling from index 1, as step 0 (audio + initial BVH) is now complete.
+  playedStepIndexRef.current = 1; 
+  
+  if (manifestCancelRef.current) {
+    manifestCancelRef.current();
+  }
+  manifestCancelRef.current = startManifestPolling(String(request_id));
+  
+  // Exit here, as the poller will handle the rest.
+  return; 
+}
 
       // STEP 3: Play immediate speech/BVH for step-1 if present, otherwise start polling
       if (canvasRef.current) {
@@ -505,75 +556,82 @@ export default function Home() {
       return { time: cue.start, value: entry.viseme, jaw: entry.jaw };
     });
 
-    const poll = async () => {
-      if (cancelled) return;
-      try {
-        const res = await fetch(`${BACKEND_URL}/api/companion/status/${requestId}`);
-        if (!res.ok) throw new Error(`manifest fetch failed: ${res.status}`);
-        const manifest = await res.json();
-        const stepsList = manifest.steps || [];
+    // This is the complete and corrected poll function
+const poll = async () => {
+  if (cancelled) return;
+  try {
+    const res = await fetch(`${BACKEND_URL}/api/companion/status/${requestId}`);
+    if (!res.ok) throw new Error(`manifest fetch failed: ${res.status}`);
+    const manifest = await res.json();
+    const stepsList = manifest.steps || [];
 
-        for (let i = playedIndex; i < stepsList.length; i++) {
-          if (cancelled) return;
-          const step = stepsList[i];
-          // show step text then play audio then bvh
-          // Remove square-bracket notes and double-curly action blocks before showing
-          const stepText = String(step.step || '')
-            .replace(/\[[^\]]*\]/g, '')
-            .replace(/\{\{[\s\S]*?\}\}/g, '')
-            .replace(/\s+/g, ' ')
-            .trim();
-          if (stepText) setMessages(prev => [...prev, { role: 'assistant', text: stepText }]);
-
-          if (step.audio_base64) {
-            try {
-              const audioUri = `data:audio/mp3;base64,${step.audio_base64}`;
-              const mapped = mapRhCuesToVisemes(step.visemes || []);
-              await canvasRef.current?.playAudioWithEmotionAndLipSync?.(audioUri, mapped, manifest.emotion || 'neutral');
-            } catch (e) { console.warn('manifest step audio failed', e); }
-          } else if (step.step) {
-            // fallback to /ask
-            try {
-              const askRes = await fetch(`${BACKEND_URL}/ask`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ text: step.step, character: selectedCharKey }) });
-              if (askRes.ok) {
-                const askJson = await askRes.json();
-                if (askJson.audio_base64) {
-                  const audioUri = `data:audio/mp3;base64,${askJson.audio_base64}`;
-                  const mapped = mapRhCuesToVisemes(askJson.visemes || []);
-                  await canvasRef.current?.playAudioWithEmotionAndLipSync?.(audioUri, mapped, askJson.emotion || 'neutral');
-                }
-              }
-            } catch (e) { console.warn('manifest step /ask fallback failed', e); }
-          }
-
-            if (Array.isArray(step.bvh_files) && step.bvh_files.length > 0) {
-            const urls = step.bvh_files.map((f: string) => `${BACKEND_URL}/generated_bvh/${f}`);
-            try {
-              // Play each BVH sequentially using the simple, natural approach
-              for (const url of urls) {
-                await canvasRef.current?.playAnimation(url);
-              }
-            } catch (e) { console.warn('manifest step BVH play failed', e); }
-            // Reset to idle after BVH sequence completes
-            try { canvasRef.current?.resetToIdle?.(); } catch (e) {}
-          }
-
-          playedIndex = i + 1;
-          playedStepIndexRef.current = playedIndex;
-        }
-
-        if (manifest.complete && playedIndex >= (manifest.steps || []).length) {
-          return; // finished
-        }
-
-        if ((stepsList.length === playedIndex) || stepsList.length === 0) emptyPolls++; else emptyPolls = 0;
-        const next = emptyPolls > 6 ? Math.min(5000, pollInterval * 3) : pollInterval;
-        if (!cancelled) setTimeout(poll, next);
-      } catch (err) {
-        console.warn('manifest poll error', err);
-        if (!cancelled) setTimeout(poll, 3000);
+    // --- REFACTORED LOGIC: Process ONLY ONE step per poll ---
+    if (stepsList.length > playedIndex) {
+      // The next step we're waiting for is now available.
+      const step = stepsList[playedIndex];
+      
+      // 1. Display the correct user-facing text for this step.
+      const userFacingText = parsedStepsRef.current[playedIndex];
+      if (userFacingText) {
+        setMessages(prev => [...prev, { role: 'assistant', text: userFacingText }]);
       }
-    };
+      
+      // 2. Handle audio playback, including the fallback to /ask.
+      if (step.audio_base64) {
+        try {
+          const audioUri = `data:audio/mp3;base64,${step.audio_base64}`;
+          const mapped = mapRhCuesToVisemes(step.visemes || []);
+          await canvasRef.current?.playAudioWithEmotionAndLipSync?.(audioUri, mapped, manifest.emotion || 'neutral');
+        } catch (e) { console.warn('manifest step audio failed', e); }
+      } else if (step.step) {
+        // Fallback to /ask if no pre-generated audio is available for the step.
+        try {
+          const askRes = await fetch(`${BACKEND_URL}/ask`, { 
+            method: 'POST', 
+            headers: {'Content-Type':'application/json'}, 
+            body: JSON.stringify({ text: step.step, character: selectedCharKey }) 
+          });
+          if (askRes.ok) {
+            const askJson = await askRes.json();
+            if (askJson.audio_base64) {
+              const audioUri = `data:audio/mp3;base64,${askJson.audio_base_64}`;
+              const mapped = mapRhCuesToVisemes(askJson.visemes || []);
+              await canvasRef.current?.playAudioWithEmotionAndLipSync?.(audioUri, mapped, askJson.emotion || 'neutral');
+            }
+          }
+        } catch (e) { console.warn('manifest step /ask fallback failed', e); }
+      }
+
+      // 3. Play the BVH animation(s) for this single step.
+      if (Array.isArray(step.bvh_files) && step.bvh_files.length > 0) {
+        const urls = step.bvh_files.map((f: string) => `${BACKEND_URL}/generated_bvh/${f}`);
+        try {
+          for (const url of urls) {
+            await canvasRef.current?.playAnimation(url);
+          }
+        } catch (e) { console.warn('manifest step BVH play failed', e); }
+      }
+
+      // 4. Increment the index so the *next* poll looks for the *next* step.
+      playedIndex++;
+      playedStepIndexRef.current = playedIndex;
+    }
+    // --- END OF REFACTORED LOGIC ---
+
+    if (manifest.complete && playedIndex >= (manifest.steps || []).length) {
+      console.log('Manifest polling complete.');
+      try { canvasRef.current?.resetToIdle?.(); } catch (e) {}
+      return; // Finished
+    }
+
+    if ((stepsList.length === playedIndex) || stepsList.length === 0) emptyPolls++; else emptyPolls = 0;
+    const next = emptyPolls > 6 ? Math.min(5000, pollInterval * 3) : pollInterval;
+    if (!cancelled) setTimeout(poll, next);
+  } catch (err) {
+    console.warn('manifest poll error', err);
+    if (!cancelled) setTimeout(poll, 3000);
+  }
+};
 
     poll();
     return () => { cancelled = true; };
@@ -666,17 +724,30 @@ canvasRef.current.playAudioWithEmotionAndLipSync(audioDataUri, visemes, 'neutral
           </div>
 
           <div className={styles.personaList}>
-            {(Object.keys(characters) as CharacterKey[]).map((key) => (
-              <div
-                key={key}
-                className={`${styles.personaItem} ${selectedCharKey === key ? styles.personaActive : ''}`}
-                onClick={() => setSelectedCharKey(key)}
-              >
-                <div className={styles.personaAvatar} />
-                <div className={styles.personaName}>{characters[key].name.split(' ')[0]}</div>
-              </div>
-            ))}
-          </div>
+  {(Object.keys(characters) as CharacterKey[]).map((key, index) => (
+    <React.Fragment key={key}>
+      <div
+        className={`${styles.personaItem} ${selectedCharKey === key ? styles.personaActive : ''}`}
+        onClick={() => setSelectedCharKey(key)}
+      >
+        <div className={styles.personaAvatar} />
+        <div className={styles.personaName}>
+          {index === 2 ? (
+            <>
+              <span>{characters[key].name.split(' ')[0]}</span>
+              <br />
+              <span>{characters[key].name.split(' ')[1]}</span>
+            </>
+          ) : (
+            characters[key].name.split(' ')[0]
+          )}
+        </div>
+      </div>
+      {/* This is the new line */}
+      {index === 2 && <div className={styles.toolsDivider} />}
+    </React.Fragment>
+  ))}
+</div>
 
           <div className={styles.sidebarTools}>
             <div className={styles.toolsDivider} />

@@ -10,8 +10,15 @@ import { bvhPlayer } from "./BVHAnimationPlayer";
 
 // Remove bracketed tokens like [Wave] or [Talkinganimation] for UI display
 const sanitizeResponse = (text: string | null | undefined) => {
-  if (!text) return "";
-  return String(text).replace(/\[[^\]]*\]/g, "").replace(/\s+/g, " ").trim();
+    if (!text) return '';
+    // Remove annotations in [], {}, {{}}, and now ()
+    return String(text)
+      .replace(/\[[^\]]*\]/g, '')       // Removes [notes]
+      .replace(/\([^)]*\)/g, '')        // Removes (emotions)
+      .replace(/\{\{[\s\S]*?\}\}/g, '') // Removes {{actions}}
+      .replace(/\{[^\}]*\}/g, '')       // Removes {fallback actions}
+      .replace(/\s+/g, ' ')
+      .trim();
 };
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL;
