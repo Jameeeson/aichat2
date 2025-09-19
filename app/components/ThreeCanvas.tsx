@@ -436,7 +436,6 @@ const ThreeCanvas = forwardRef<ThreeCanvasHandles, ThreeCanvasProps>(
     return sorted[0] || null;
   };
 
-  // NEW: Camera follow mode helpers
 const startFollowing = () => {
   const camera = cameraRef.current;
   const controls = controlsRef.current;
@@ -460,49 +459,33 @@ const startFollowing = () => {
   const anchorPos = new THREE.Vector3();
   anchor.getWorldPosition(anchorPos);
 
-  // Read the desired view from our new configuration ref
-  const { distance, height, side } = followViewRef.current;
-
-  // Calculate the desired position for the camera and its target
-  const desiredCamPos = new THREE.Vector3(
-    anchorPos.x + side,
-    anchorPos.y + height,
-    anchorPos.z + distance
-  );
-  // The point the camera will look at. We aim it slightly lower than the camera's height.
-  const desiredTargetPos = new THREE.Vector3(
-    anchorPos.x,
-    anchorPos.y + (height * 0.9),
-    anchorPos.z
-  );
-
   // Calculate and store the offsets from the anchor's position.
   // The animate() loop will use these offsets to keep the camera in place.
-  cameraOffsetRef.current.copy(desiredCamPos).sub(anchorPos);
-  controlsOffsetRef.current.copy(desiredTargetPos).sub(anchorPos);
+  cameraOffsetRef.current.copy(camera.position).sub(anchorPos);
+  controlsOffsetRef.current.copy(controls.target).sub(anchorPos);
 
-  // Disable user panning during follow mode for a smoother experience
+  // Disable user panning and rotation during follow mode for a smoother experience
   controls.enablePan = false;
+  controls.enableRotate = false; // Prevent user rotation while tracking
   controls.enableDamping = true;
 
   isFollowingRef.current = true;
-  console.log("BVH camera follow: Started with custom view.");
+  console.log("BVH camera follow: Started.");
 };
 
-  const stopFollowing = () => {
-    if (!isFollowingRef.current) return;
-    isFollowingRef.current = false;
+const stopFollowing = () => {
+  if (!isFollowingRef.current) return;
+  isFollowingRef.current = false;
 
-    const controls = controlsRef.current;
-    
-    // Restore original controls state
-    if (controls && prevControlsStateRef.current) {
-      Object.assign(controls, prevControlsStateRef.current);
-      prevControlsStateRef.current = null;
-    }
-    console.log("BVH camera follow: Stopped.");
-  };
-
+  const controls = controlsRef.current;
+  
+  // Restore original controls state
+  if (controls && prevControlsStateRef.current) {
+    Object.assign(controls, prevControlsStateRef.current);
+    prevControlsStateRef.current = null;
+  }
+  console.log("BVH camera follow: Stopped.");
+};
     const targetVisemeWeights = useRef<{ [key: string]: number }>({}).current;
     const targetJawOpen = useRef(0);
     const targetEmotionWeights = useRef<{ [key: string]: number }>({}).current;
@@ -642,13 +625,14 @@ const startFollowing = () => {
       enableDamping: boolean;
       dampingFactor: number;
     } | null>(null);
-     const cameraRestorePosRef = useRef<THREE.Vector3 | null>(null);
+    const resetToIdleRef = useRef<() => void>(() => {});
+    const cameraRestorePosRef = useRef<THREE.Vector3 | null>(null);
     const cameraRestoreTargetRef = useRef<THREE.Vector3 | null>(null);
   // Desired front-view camera settings during follow (tweak to taste)
   // Use a small distance and zero side to stay centered and closer to the character.
   // Lowered height so follow view isn't too high above the character.
   const followViewRef = useRef({ 
-    distance: 3.0, // How far back the camera is.
+    distance: 4.0, // How far back the camera is.
     height: 1.0,   // How high the camera is.
     side: 1.5      // How far to the character's side (positive = right, negative = left).
 });
@@ -1209,61 +1193,40 @@ const processMixamoQueue = async () => {
               };
               const retargetedClip = SkeletonUtils.retargetClip(bodyMesh, bvh.skeleton, bvh.clip, options);
               
-              retargetedClip.tracks = retargetedClip.tracks.filter(
-                track => track.name !== 'Hips.position'
-              );
-
-              // --- 2. DEFINE THE "ACTION CAM" VIEW ---
-              const bvhViewPos = camera.position.clone();
-              const bvhViewTarget = controls.target.clone();
-              
-              // Move the camera down
-              bvhViewPos.y -= 0.4;
-              bvhViewTarget.y -= 0.4;
-
-              // Move the camera backwards (away from the model)
-              bvhViewPos.z += 1;
-
-              // --- 3. TWEEN to the new position ---
-              tweenCamera(bvhViewPos, bvhViewTarget, 600); 
+              // We keep Hips.position for BVH files to allow movement.
+              // We will control the camera to follow it.
 
               const action = mixer.clipAction(retargetedClip);
               action.setLoop(THREE.LoopOnce, 1);
               action.clampWhenFinished = true;
+              
+              // Fade out idle animation to let BVH take over
+              idleAction.fadeOut(0.5);
               action.play();
+
+              // --- FIX: START the follow camera ---
+              startFollowing();
 
               const onFinished = (e: any) => {
                 if (e.action === action) {
                   mixer.removeEventListener("finished", onFinished);
+
+                  // --- FIX: STOP the follow camera ---
+                  stopFollowing();
                   
-                  // --- 4. TWEEN BACK to the saved position ---
-                  if (cameraRestorePosRef.current && cameraRestoreTargetRef.current) {
-                    tweenCamera(cameraRestorePosRef.current, cameraRestoreTargetRef.current, 600)
-                      .then(() => {
-                        cameraRestorePosRef.current = null;
-                        cameraRestoreTargetRef.current = null;
-                      });
-                  }
+                  resetToIdleRef.current(); 
                   
-                  try {
-                    action.stop();
-                    if (idleAction) {
-                      idleAction.reset().play();
-                    }
-                  } catch {}
-                  resolve();
+                  // We resolve the promise after a short delay to allow the fade-in of the idle animation to start.
+                  setTimeout(resolve, 500);
                 }
               };
               mixer.addEventListener("finished", onFinished);
             },
             undefined,
             (error) => {
-              if (cameraRestorePosRef.current && cameraRestoreTargetRef.current) {
-                tweenCamera(cameraRestorePosRef.current, cameraRestoreTargetRef.current, 600);
-                cameraRestorePosRef.current = null;
-                cameraRestoreTargetRef.current = null;
-              }
               console.error("Error loading BVH:", error);
+              // Also reset here on error
+              tweenCamera(cameraStartPosRef.current, controlsStartTargetRef.current, 600);
               reject(error);
             }
           );
@@ -1275,10 +1238,6 @@ const processMixamoQueue = async () => {
         speechEmotionIntensityRef.current = 1;
       },
       setTyping: (isTyping: boolean) => {
-        // Simplified typing: only track the boolean flag but do NOT change
-        // animation actions. This preserves the idle/talking loop while typing
-        // in the chat input and prevents frozen/held poses from leaking into
-        // subsequent gestures or speeches.
         typingActiveRef.current = Boolean(isTyping);
         // Ensure we don't keep any frozen head/neck quaternions or timers
         clearTypingHoldTimeout();
@@ -1291,6 +1250,9 @@ const processMixamoQueue = async () => {
           const mixer = mixerRef.current;
           const body = bodyMeshRef.current;
           const idle = idleActionRef.current;
+          const camera = cameraRef.current;
+          const controls = controlsRef.current;
+
           // Stop any running actions
           if (mixer) mixer.stopAllAction();
           // Restore skeleton bind pose
@@ -1301,6 +1263,15 @@ const processMixamoQueue = async () => {
             modelRootRef.current.quaternion.copy(modelStartQuatRef.current);
             (modelRootRef.current as any).updateMatrixWorld?.(true);
           }
+
+          // Reset camera and controls to their initial state
+          if (camera && controls) {
+            stopFollowing(); // Ensure any camera tracking is disabled
+            camera.position.copy(cameraStartPosRef.current);
+            controls.target.copy(controlsStartTargetRef.current);
+            controls.update();
+          }
+
           // Clear typing state
           typingActiveRef.current = false;
           clearTypingHoldTimeout();
@@ -1325,19 +1296,58 @@ const processMixamoQueue = async () => {
           idleAction: idleActionRef.current,
         };
       },
-  // Mixamo/gesture API removed — callers should no longer invoke this.
   }));
 
-  // Mixamo/gesture internal implementation removed.
+ 
 
-    // Removed simplified mounting useEffect to avoid creating a second canvas and
-    // duplicate loaders. The consolidated useEffect later in this file performs
-    // all rendering and asset loading (multi-idle sequencing, typing, gestures,
-    // etc.). Keeping only the consolidated effect prevents conflicts where the
-    // visible model could be replaced or hidden by a second renderer.
+   const resetToIdle = () => {
+      try {
+        const mixer = mixerRef.current;
+        const body = bodyMeshRef.current;
+        const idle = idleActionRef.current;
+        const camera = cameraRef.current;
+        const controls = controlsRef.current;
 
-    // Handle assets after Promise.all resolves. Pulled out as a helper to keep
-    // the main effect body short and easier to read.
+        // Stop camera follow just in case
+        stopFollowing();
+
+        // Stop all animations
+        if (mixer) {
+            mixer.stopAllAction();
+        }
+
+        // Reset the model's skeleton to its bind pose
+        if (body?.skeleton) {
+            body.skeleton.pose();
+        }
+        
+        // ** CRUCIAL STEP **
+        // Reset the model's root object to its initial position and rotation
+        if (modelRootRef.current) {
+          modelRootRef.current.position.copy(modelStartPosRef.current);
+          modelRootRef.current.quaternion.copy(modelStartQuatRef.current);
+          modelRootRef.current.updateMatrixWorld(true);
+        }
+
+        // Reset the camera and controls to their initial state
+        if (camera && controls) {
+          camera.position.copy(cameraStartPosRef.current);
+          controls.target.copy(controlsStartTargetRef.current);
+          controls.update();
+        }
+
+        // Restart the idle animation loop
+        if (idle) {
+          idle.reset().setEffectiveWeight(1).fadeIn(FADE_DURATION).play();
+        }
+      } catch (err) {
+        console.error("Failed to reset to idle:", err);
+      }
+    };
+    
+    // Assign the function to the ref so it can be called from the imperative handle
+    resetToIdleRef.current = resetToIdle;
+    
     const handleAssetsLoaded = (
       assets: any[],
       scene: THREE.Scene,
@@ -1373,7 +1383,7 @@ const processMixamoQueue = async () => {
       findBestSkinnedMesh(characterModel) ||
       (characterModel.getObjectByProperty("isSkinnedMesh", true) as THREE.SkinnedMesh);
 
-    // NEW: Set the anchor point for the follow camera
+    // Set the anchor point for the follow camera to the Hips/Pelvis bone
     if (bodyMeshRef.current) {
         followAnchorRef.current = findPelvisBone(bodyMeshRef.current);
     }
@@ -1733,6 +1743,10 @@ const processMixamoQueue = async () => {
       cameraRef.current = camera;
       controlsRef.current = controls;
 
+      // Store initial camera state for resetting
+      cameraStartPosRef.current.copy(camera.position);
+      controlsStartTargetRef.current.copy(controls.target);
+
       // Ensure we render the background scene first (if present) then the main scene.
       // Use autoClear=false so we can composite both scenes.
       renderer.autoClear = false;
@@ -1754,9 +1768,6 @@ const processMixamoQueue = async () => {
             const nodFrequency = 0.4;  // Up-down nod frequency
             const nodAmplitude = 0.03;  // Up-down nod amount
             
-            // --- THE FIX ---
-            // Base angle for chin down. -0.2 is a subtle look down. 
-            // The original value of -2 was too large (rotations are in radians).
             const baseHeadXRotation = -0.2; 
 
             // 1. SET the up/down rotation directly (overrides the animation).
@@ -1848,69 +1859,54 @@ const processMixamoQueue = async () => {
           } catch (e) { /* ignore emotion errors */ }
         }
 
-        // Follow anchor (used during BVH play)
-       if (isFollowingRef.current && followAnchorRef.current) {
-  try {
-    const anchor = followAnchorRef.current;
-    const camera = cameraRef.current!;
-    const controls = controlsRef.current!;
-
-    anchor.updateMatrixWorld?.(true);
-    const anchorPos = new THREE.Vector3();
-    const anchorQuat = new THREE.Quaternion();
-    anchor.getWorldPosition(anchorPos);
-    anchor.getWorldQuaternion(anchorQuat); // Get the character's rotation
-
-    // Apply the character's rotation to our camera offset. This is key!
-    const desiredCamPos = new THREE.Vector3().copy(cameraOffsetRef.current).applyQuaternion(anchorQuat).add(anchorPos);
-    
-    if (Number.isFinite(desiredCamPos.x + desiredCamPos.y + desiredCamPos.z)) {
-      // Use a small lerp value for smooth, cinematic tracking
-      camera.position.lerp(desiredCamPos, 0.08); 
-      lastGoodCameraPosRef.current.copy(camera.position);
-    } else {
-      camera.position.copy(lastGoodCameraPosRef.current); // Recover if math goes wrong
-    }
-
-    const desiredTarget = new THREE.Vector3().copy(controlsOffsetRef.current).add(anchorPos);
-    controls.target.lerp(desiredTarget, 0.08);
-
-  } catch (e) {
-    console.warn("Error during camera follow:", e);
-    stopFollowing();
-  }
-}
-
+        // --- FIX: Correct camera following logic ---
         if (isFollowingRef.current && followAnchorRef.current) {
-  try {
-    const anchor = followAnchorRef.current;
-    const camera = cameraRef.current!;
-    const controls = controlsRef.current!;
+          try {
+            const anchor = followAnchorRef.current;
+            const camera = cameraRef.current!;
+            const controls = controlsRef.current!;
+        
+            anchor.updateMatrixWorld(true);
+            const anchorPos = new THREE.Vector3();
+            const anchorQuat = new THREE.Quaternion();
+            anchor.getWorldPosition(anchorPos);
+            anchor.getWorldQuaternion(anchorQuat);
+        
+            
+const { distance, height, side } = followViewRef.current;
+        
+        // Start with a vector pointing straight back (positive Z)
+        const desiredOffset = new THREE.Vector3(side, height, distance);
+        
+        // This is the desired camera position *relative to the anchor*
+        const desiredCamPos = new THREE.Vector3().copy(anchorPos).add(desiredOffset);
+        
+        // Now, we calculate the offset vector needed to achieve this position.
+        // We store this offset so the animate() loop can use it.
+        cameraOffsetRef.current.copy(desiredCamPos).sub(anchorPos);
 
-    anchor.updateMatrixWorld(true);
-    const anchorPos = new THREE.Vector3();
-    anchor.getWorldPosition(anchorPos);
+        // The target should be slightly below the camera's height for a good angle.
+        const desiredTargetPos = new THREE.Vector3(anchorPos.x, height - 0.4, anchorPos.z);
+        controlsOffsetRef.current.copy(desiredTargetPos).sub(anchorPos);
 
-    // Calculate the desired camera and target positions based on stored offsets
-    const desiredCamPos = new THREE.Vector3().copy(anchorPos).add(cameraOffsetRef.current);
-    const desiredTargetPos = new THREE.Vector3().copy(anchorPos).add(controlsOffsetRef.current);
+        controls.enablePan = false;
+        controls.enableRotate = false;
+        controls.enableDamping = true;
 
-    // Smoothly move the camera and its target towards the desired positions
-    if (Number.isFinite(desiredCamPos.x)) {
-        camera.position.lerp(desiredCamPos, 0.1);
-        lastGoodCameraPosRef.current.copy(camera.position);
-    } else {
-        camera.position.copy(lastGoodCameraPosRef.current); // Recover if values are invalid
-    }
-    
-    controls.target.lerp(desiredTargetPos, 0.1);
-
-  } catch (e) {
-    // Stop following on error to prevent breaking the render loop
-    console.error("Error in camera follow logic:", e);
-    stopFollowing();
-  }
-}
+        isFollowingRef.current = true;
+        console.log("BVH camera follow: Started with custom view.", { distance, height, side });
+        
+            // Smoothly interpolate camera and target positions
+            if (Number.isFinite(desiredCamPos.x)) {
+              camera.position.lerp(desiredCamPos, 0.1);
+            }
+            controls.target.lerp(desiredTargetPos, 0.1);
+        
+          } catch (e) {
+            console.error("Error in camera follow logic:", e);
+            stopFollowing(); // Stop following on error to prevent breaking the render loop
+          }
+        }
 
         try { controls.update(); } catch (e) {}
         // Clear once, then render background (fullscreen quad) then main scene
@@ -2024,4 +2020,3 @@ const processMixamoQueue = async () => {
 );
 
 export default ThreeCanvas;
-
