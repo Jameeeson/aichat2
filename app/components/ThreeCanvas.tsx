@@ -88,11 +88,16 @@ export type Emotion =
   | "annoyed"
   | "flirty";
 
+type SpeechPlaybackOptions = {
+  holdPose?: boolean;
+};
+
 export interface ThreeCanvasHandles {
   playAudioWithEmotionAndLipSync: (
     audioUrl: string,
     visemes: { time: number; value: string; jaw: number }[],
-    emotion: Emotion
+    emotion: Emotion,
+    options?: SpeechPlaybackOptions
   ) => Promise<void>;
   playAnimation: (url: string) => Promise<void>;
   setStaticEmotion: (emotion: Emotion) => void;
@@ -454,23 +459,34 @@ const startFollowing = () => {
     dampingFactor: controls.dampingFactor,
   };
 
-  // Get the anchor's current world position
+  // Get current anchor position to establish relative offset
   anchor.updateMatrixWorld(true);
   const anchorPos = new THREE.Vector3();
   anchor.getWorldPosition(anchorPos);
 
-  // Calculate and store the offsets from the anchor's position.
-  // The animate() loop will use these offsets to keep the camera in place.
-  cameraOffsetRef.current.copy(camera.position).sub(anchorPos);
-  controlsOffsetRef.current.copy(controls.target).sub(anchorPos);
+  // Stable orbit offset: keep horizontal distance & gentle height offset
+  const currentOffset = camera.position.clone().sub(anchorPos);
+  // If first follow or tiny offset, use default
+  if (currentOffset.length() < 0.5) currentOffset.set(0, 0, 4);
+  // Project to horizontal plane for stability (avoid dipping with pushups)
+  const horiz = currentOffset.clone();
+  horiz.y = 0;
+  if (horiz.length() < 0.5) horiz.set(0, 0, 4);
+  horiz.normalize().multiplyScalar(Math.min(Math.max(horiz.length(), 2.5), 6));
+  // Desired camera offset adds fixed height (1.6m default eye level)
+  const desired = anchorPos.clone().add(horiz).add(new THREE.Vector3(0, followHeightsRef.current.cameraHeight, 0));
+  cameraOffsetRef.current.copy(desired.sub(anchorPos)); // store relative world offset
+  // Target offset aims slightly below previous to lift character in frame
+  controlsOffsetRef.current.set(0, followHeightsRef.current.targetHeight, 0);
 
-  // Disable user panning and rotation during follow mode for a smoother experience
+  // Allow some user control during follow mode
   controls.enablePan = false;
-  controls.enableRotate = false; // Prevent user rotation while tracking
+  controls.enableRotate = true;
   controls.enableDamping = true;
+  controls.dampingFactor = 0.12;
 
   isFollowingRef.current = true;
-  console.log("BVH camera follow: Started.");
+  console.log("BVH camera follow: Started with offset:", cameraOffsetRef.current);
 };
 
 const stopFollowing = () => {
@@ -507,7 +523,8 @@ const stopFollowing = () => {
     const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
     const currentSpeechEmotionRef = useRef<Emotion>("neutral");
     const speechEmotionIntensityRef = useRef(0);
-
+    const isPlayingSpeechRef = useRef(false);
+    
     // Blink state for automatic eye blinking
     const nextBlinkAtRef = useRef<number>(performance.now() + 1200 + Math.random() * 2000);
     const blinkProgressRef = useRef<number>(0);
@@ -611,6 +628,11 @@ const stopFollowing = () => {
     const controlsStartTargetRef = useRef(new THREE.Vector3());
     const cameraOffsetRef = useRef(new THREE.Vector3());
     const controlsOffsetRef = useRef(new THREE.Vector3());
+    // Configurable follow camera vertical offsets
+    const followHeightsRef = useRef({
+      cameraHeight: 0.2, // lowered from 1.6 to bring model higher in frame
+      targetHeight: 0.2, // aim slightly above hips but below previous 1.4
+    });
     // Last known good finite camera transform (for recovering from NaN/Infinity)
     const lastGoodCameraPosRef = useRef(new THREE.Vector3(0, 1, 3));
     const lastGoodCameraQuatRef = useRef(new THREE.Quaternion());
@@ -625,6 +647,14 @@ const stopFollowing = () => {
       enableDamping: boolean;
       dampingFactor: number;
     } | null>(null);
+    // Root motion capture between sequential BVH clips so the next clip starts
+    // where the previous ended (accumulated on the model root, not on the hip).
+    const rootMotionRef = useRef({
+      capturing: false,
+      startHipWorldPos: new THREE.Vector3(),
+      startHipLocalPos: new THREE.Vector3(),
+      startHipWorldQuat: new THREE.Quaternion(),
+    });
     const resetToIdleRef = useRef<() => void>(() => {});
     const cameraRestorePosRef = useRef<THREE.Vector3 | null>(null);
     const cameraRestoreTargetRef = useRef<THREE.Vector3 | null>(null);
@@ -638,11 +668,13 @@ const stopFollowing = () => {
 });
 
       const playAudioWithEmotionAndLipSync = async (
-      audioUrl: string,
-      visemes: { time: number; value: string; jaw: number }[],
-      emotion: Emotion,
-      onEndedCallback?: () => void
-    ) => {
+        audioUrl: string,
+        visemes: { time: number; value: string; jaw: number }[],
+        emotion: Emotion,
+        options?: SpeechPlaybackOptions,
+        onEndedCleanup?: () => void
+      ) => {
+        const holdPose = options?.holdPose ?? false;
       // Wait for face mesh to be ready (up to 3s) so we don't drop early calls
       const waitFace = async (timeoutMs = 3000) => {
         const start = performance.now();
@@ -706,6 +738,7 @@ const stopFollowing = () => {
           source.onended = () => {
             isWaitingAfterTalkRef.current = true;
             source.onended = null;
+            const settleDelay = holdPose ? 200 : 2000;
             setTimeout(() => {
               if (faceMesh) {
                 faceMesh.userData.visemes = [];
@@ -721,16 +754,18 @@ const stopFollowing = () => {
                   talkingAct.fadeOut(0.3);
                   currentlyPlayingTalkingActionRef.current = null;
                 }
-                const playlist = loopActionsRef.current;
-                const idleAct = idleActionRef.current;
-                if (playlist.length > 0) {
-                  const next = playlist[(currentLoopIndexRef.current + 1) % playlist.length];
-                  if (next) {
-                    next.reset().setEffectiveWeight(1).fadeIn(0.3).play();
-                    currentLoopActionRef.current = next;
+                if (!holdPose) {
+                  const playlist = loopActionsRef.current;
+                  const idleAct = idleActionRef.current;
+                  if (playlist.length > 0) {
+                    const next = playlist[(currentLoopIndexRef.current + 1) % playlist.length];
+                    if (next) {
+                      next.reset().setEffectiveWeight(1).fadeIn(0.3).play();
+                      currentLoopActionRef.current = next;
+                    }
+                  } else if (idleAct) {
+                    idleAct.reset().setEffectiveWeight(1).fadeIn(0.3).play();
                   }
-                } else if (idleAct) {
-                  idleAct.reset().setEffectiveWeight(1).fadeIn(0.3).play();
                 }
                 animationStateRef.current = "idle";
               } catch (e) {}
@@ -739,9 +774,9 @@ const stopFollowing = () => {
               currentSpeechEmotionRef.current = "neutral";
               // set intensity to 0 to allow morphs to relax to neutral
               speechEmotionIntensityRef.current = 0;
-              if (onEndedCallback) onEndedCallback();
+              if (onEndedCleanup) onEndedCleanup();
               resolve();
-            }, 2000);
+            }, settleDelay);
           };
 
           // If we have talking actions available, start one now so the character animates while audio plays
@@ -994,45 +1029,65 @@ const processMixamoQueue = async () => {
       playAudioWithEmotionAndLipSync: async (
         audioBase64OrUrl,
         visemes,
-        emotion
+        emotion,
+        options?: SpeechPlaybackOptions
       ) => {
-        // Ensure typing pose is cleared before speech
-        if (typingActiveRef.current) {
-          typingActiveRef.current = false;
-          const idle = idleActionRef.current;
-          const playlist = loopActionsRef.current;
-          // Resume loop or idle
-          if (playlist.length > 0) {
-            const prev = currentLoopActionRef.current;
-            if (prev?.isRunning()) prev.fadeOut(0.3);
-            currentLoopIndexRef.current = (currentLoopIndexRef.current + 1) % playlist.length;
-            const next = playlist[currentLoopIndexRef.current];
-            next.reset().setEffectiveWeight(1).fadeIn(0.3).play();
-            currentLoopActionRef.current = next;
-          } else if (idle) {
-            idle.reset().setEffectiveWeight(1).fadeIn(0.3).play();
-          }
+         // --- NEW: Check if speech is already in progress ---
+  if (isPlayingSpeechRef.current) {
+    console.warn("ThreeCanvas: A new speech request was ignored because another is already playing.");
+    return; // Exit immediately
+  }
+
+  // --- NEW: Set the lock to prevent other calls from starting ---
+  isPlayingSpeechRef.current = true;
+
+  try {
+    // --- This is all your original code, now inside a try block ---
+    if (typingActiveRef.current) {
+      typingActiveRef.current = false;
+      const idle = idleActionRef.current;
+      const playlist = loopActionsRef.current;
+      if (playlist.length > 0) {
+        const prev = currentLoopActionRef.current;
+        if (prev?.isRunning()) prev.fadeOut(0.3);
+        currentLoopIndexRef.current = (currentLoopIndexRef.current + 1) % playlist.length;
+        const next = playlist[currentLoopIndexRef.current];
+        next.reset().setEffectiveWeight(1).fadeIn(0.3).play();
+        currentLoopActionRef.current = next;
+      } else if (idle) {
+        idle.reset().setEffectiveWeight(1).fadeIn(0.3).play();
+      }
+    }
+    const isBase64 = audioBase64OrUrl.startsWith("data:audio");
+    if (isBase64) {
+      const audioBlob = await (await fetch(audioBase64OrUrl)).blob();
+      const audioUrl = URL.createObjectURL(audioBlob);
+      // Make sure to await the inner function call
+      await playAudioWithEmotionAndLipSync(
+        audioUrl,
+        visemes,
+        emotion,
+        options,
+        () => {
+          URL.revokeObjectURL(audioUrl);
         }
-        const isBase64 = audioBase64OrUrl.startsWith("data:audio");
-        if (isBase64) {
-          const audioBlob = await (await fetch(audioBase64OrUrl)).blob();
-          const audioUrl = URL.createObjectURL(audioBlob);
-          await playAudioWithEmotionAndLipSync(
-            audioUrl,
-            visemes,
-            emotion,
-            () => {
-              URL.revokeObjectURL(audioUrl);
-            }
-          );
-        } else {
-          await playAudioWithEmotionAndLipSync(
-            audioBase64OrUrl,
-            visemes,
-            emotion
-          );
-        }
-      },
+      );
+    } else {
+      // Make sure to await the inner function call
+      await playAudioWithEmotionAndLipSync(
+        audioBase64OrUrl,
+        visemes,
+        emotion,
+        options
+      );
+    }
+  } catch (error) {
+    console.error("An error occurred during speech playback:", error);
+  } finally {
+    // --- NEW: Release the lock so the next speech can play ---
+    isPlayingSpeechRef.current = false;
+  }
+},
       // Backwards-compatible wrapper some pages use
       playAudioWithLipSync: async (audioBase64OrUrl: string, visemes: any[]) => {
         // Default to neutral emotion
@@ -1045,19 +1100,7 @@ const processMixamoQueue = async () => {
         typingActiveRef.current = false;
         typingHeadQuatRef.current = null;
         typingNeckQuatRef.current = null;
-        // If we captured a neutral base pose for head/neck, restore it now so gestures start from neutral
-        try {
-          if (hasCapturedBasePoseRef.current) {
-            if (headBoneRef.current) headBoneRef.current.quaternion.copy(headBaseQuatRef.current);
-            if (neckBoneRef.current) neckBoneRef.current.quaternion.copy(neckBaseQuatRef.current);
-            // Also reset the model root transform so gestures start facing the original front
-            if (modelRootRef.current) {
-              modelRootRef.current.position.copy(modelStartPosRef.current);
-              modelRootRef.current.quaternion.copy(modelStartQuatRef.current);
-              (modelRootRef.current as any)?.updateMatrixWorld?.(true);
-            }
-          }
-        } catch (e) {}
+        // Do NOT reset modelRoot position/rotation here; preserve accumulated root motion
 
         const fbxLoader = new FBXLoader();
         const list = Array.isArray(urls) ? urls : [urls];
@@ -1164,6 +1207,8 @@ const processMixamoQueue = async () => {
         const bodyMesh = bodyMeshRef.current;
         const camera = cameraRef.current;
         const controls = controlsRef.current;
+        const modelRoot = modelRootRef.current;
+        const hipBone = (followAnchorRef.current as THREE.Bone) || null;
 
         if (!mixer || !idleAction || !bodyMesh || !camera || !controls) {
           console.error("Animation prerequisites not ready.");
@@ -1175,6 +1220,24 @@ const processMixamoQueue = async () => {
           if (!cameraRestorePosRef.current) {
             cameraRestorePosRef.current = camera.position.clone();
             cameraRestoreTargetRef.current = controls.target.clone();
+          }
+
+          // --- 2. Capture root motion start state ---
+          if (hipBone) {
+            try {
+              hipBone.updateMatrixWorld(true);
+              rootMotionRef.current.startHipWorldPos.copy(
+                hipBone.getWorldPosition(new THREE.Vector3())
+              );
+              rootMotionRef.current.startHipLocalPos.copy(hipBone.position);
+              rootMotionRef.current.startHipWorldQuat.copy(
+                hipBone.getWorldQuaternion(new THREE.Quaternion())
+              );
+              rootMotionRef.current.capturing = true;
+            } catch (e) {
+              console.warn("Root motion start capture failed:", e);
+              rootMotionRef.current.capturing = false;
+            }
           }
 
           const bvhLoader = new BVHLoader();
@@ -1200,24 +1263,57 @@ const processMixamoQueue = async () => {
               action.setLoop(THREE.LoopOnce, 1);
               action.clampWhenFinished = true;
               
-              // Fade out idle animation to let BVH take over
-              idleAction.fadeOut(0.5);
-              action.play();
+              // Fade out idle animation to let BVH take over (shorter fade)
+              idleAction.fadeOut(0.25);
+              action.reset().play(); // Ensure action starts fresh
 
-              // --- FIX: START the follow camera ---
+              // --- START camera follow ---
               startFollowing();
 
               const onFinished = (e: any) => {
                 if (e.action === action) {
                   mixer.removeEventListener("finished", onFinished);
 
-                  // --- FIX: STOP the follow camera ---
-                  stopFollowing();
+                  // Keep following active until explicit stop (smooth multi-part chains)
+
+                  // --- Root motion accumulation ---
+                  if (rootMotionRef.current.capturing && hipBone) {
+                    try {
+                      hipBone.updateMatrixWorld(true);
+                      const endHipWorldPos = hipBone.getWorldPosition(new THREE.Vector3());
+                      const endHipWorldQuat = hipBone.getWorldQuaternion(new THREE.Quaternion());
+
+                      // Position delta (keep full delta; if you only want horizontal: set delta.y = 0)
+                      const deltaPos = endHipWorldPos.clone().sub(rootMotionRef.current.startHipWorldPos);
+                      // If you want only horizontal displacement, uncomment next line
+                      // deltaPos.y = 0;
+                      if (modelRoot) modelRoot.position.add(deltaPos);
+
+                      // Yaw (horizontal facing) accumulation
+                      const startEuler = new THREE.Euler().setFromQuaternion(rootMotionRef.current.startHipWorldQuat, 'YXZ');
+                      const endEuler = new THREE.Euler().setFromQuaternion(endHipWorldQuat, 'YXZ');
+                      let yawDelta = endEuler.y - startEuler.y;
+                      // Normalize yaw to [-PI, PI] to avoid cumulative drift from 2π wraps
+                      yawDelta = ((yawDelta + Math.PI) % (Math.PI * 2)) - Math.PI;
+                      if (modelRoot) modelRoot.rotateY(yawDelta);
+
+                      // Re-center hip local translation so next clip starts fresh
+                      hipBone.position.copy(rootMotionRef.current.startHipLocalPos);
+
+                      if (modelRoot) modelRoot.updateMatrixWorld(true);
+                      hipBone.updateMatrixWorld(true);
+                    } catch (err) {
+                      console.warn("Root motion bake failed:", err);
+                    } finally {
+                      rootMotionRef.current.capturing = false;
+                    }
+                  }
+
+                  // Leave in final pose; do not reset; keep accumulated transform
+                  console.log("BVH animation finished; accumulated position:", modelRoot?.position.toArray());
                   
-                  resetToIdleRef.current(); 
-                  
-                  // We resolve the promise after a short delay to allow the fade-in of the idle animation to start.
-                  setTimeout(resolve, 500);
+                  // Resolve the promise after a short delay
+                  setTimeout(resolve, 300);
                 }
               };
               mixer.addEventListener("finished", onFinished);
@@ -1225,8 +1321,7 @@ const processMixamoQueue = async () => {
             undefined,
             (error) => {
               console.error("Error loading BVH:", error);
-              // Also reset here on error
-              tweenCamera(cameraStartPosRef.current, controlsStartTargetRef.current, 600);
+              stopFollowing();
               reject(error);
             }
           );
@@ -1252,25 +1347,11 @@ const processMixamoQueue = async () => {
           const idle = idleActionRef.current;
           const camera = cameraRef.current;
           const controls = controlsRef.current;
-
-          // Stop any running actions
           if (mixer) mixer.stopAllAction();
-          // Restore skeleton bind pose
-          if (body && body.skeleton) body.skeleton.pose();
-          // Reset model root transform
-          if (modelRootRef.current) {
-            modelRootRef.current.position.copy(modelStartPosRef.current);
-            modelRootRef.current.quaternion.copy(modelStartQuatRef.current);
-            (modelRootRef.current as any).updateMatrixWorld?.(true);
-          }
+          if (body?.skeleton) body.skeleton.pose();
+          // NOTE: Do NOT reset modelRoot position so chain continuity remains
 
-          // Reset camera and controls to their initial state
-          if (camera && controls) {
-            stopFollowing(); // Ensure any camera tracking is disabled
-            camera.position.copy(cameraStartPosRef.current);
-            controls.target.copy(controlsStartTargetRef.current);
-            controls.update();
-          }
+          // Keep camera where it is; if you want a manual recenter provide another method
 
           // Clear typing state
           typingActiveRef.current = false;
@@ -1281,10 +1362,7 @@ const processMixamoQueue = async () => {
           currentLoopActionRef.current = null;
           currentlyPlayingTalkingActionRef.current = null;
           animationStateRef.current = "idle";
-          // Ensure idle is playing
-          if (idle) {
-            idle.reset().setEffectiveWeight(1).fadeIn(FADE_DURATION).play();
-          }
+          if (idle) idle.reset().setEffectiveWeight(1).fadeIn(0.4).play();
         } catch (err) {
           // ignore errors during best-effort reset
         }
@@ -1295,6 +1373,10 @@ const processMixamoQueue = async () => {
           model: bodyMeshRef.current ? bodyMeshRef.current.parent : null,
           idleAction: idleActionRef.current,
         };
+      },
+      setFollowHeights: (cameraHeight: number, targetHeight?: number) => {
+        followHeightsRef.current.cameraHeight = cameraHeight;
+        if (typeof targetHeight === 'number') followHeightsRef.current.targetHeight = targetHeight;
       },
   }));
 
@@ -1860,51 +1942,44 @@ const processMixamoQueue = async () => {
         }
 
         // --- FIX: Correct camera following logic ---
+        // --- Camera following logic ---
         if (isFollowingRef.current && followAnchorRef.current) {
           try {
             const anchor = followAnchorRef.current;
             const camera = cameraRef.current!;
             const controls = controlsRef.current!;
-        
+            
             anchor.updateMatrixWorld(true);
             const anchorPos = new THREE.Vector3();
-            const anchorQuat = new THREE.Quaternion();
             anchor.getWorldPosition(anchorPos);
-            anchor.getWorldQuaternion(anchorQuat);
-        
-            
-const { distance, height, side } = followViewRef.current;
-        
-        // Start with a vector pointing straight back (positive Z)
-        const desiredOffset = new THREE.Vector3(side, height, distance);
-        
-        // This is the desired camera position *relative to the anchor*
-        const desiredCamPos = new THREE.Vector3().copy(anchorPos).add(desiredOffset);
-        
-        // Now, we calculate the offset vector needed to achieve this position.
-        // We store this offset so the animate() loop can use it.
-        cameraOffsetRef.current.copy(desiredCamPos).sub(anchorPos);
 
-        // The target should be slightly below the camera's height for a good angle.
-        const desiredTargetPos = new THREE.Vector3(anchorPos.x, height - 0.4, anchorPos.z);
-        controlsOffsetRef.current.copy(desiredTargetPos).sub(anchorPos);
+            // Apply the stored offset to follow the anchor dynamically
+            const desiredCamPos = anchorPos.clone().add(cameraOffsetRef.current);
+            const desiredTarget = anchorPos.clone().add(controlsOffsetRef.current);
 
-        controls.enablePan = false;
-        controls.enableRotate = false;
-        controls.enableDamping = true;
+            // Smooth interpolation with different speeds for position and target
+            camera.position.lerp(desiredCamPos, 0.08); // Slightly slower for smoother motion
+            controls.target.lerp(desiredTarget, 0.12);  // Faster target tracking
 
-        isFollowingRef.current = true;
-        console.log("BVH camera follow: Started with custom view.", { distance, height, side });
-        
-            // Smoothly interpolate camera and target positions
-            if (Number.isFinite(desiredCamPos.x)) {
-              camera.position.lerp(desiredCamPos, 0.1);
+            // Ensure camera doesn't go below ground level (minimum Y = 0.2)
+            if (camera.position.y < 0.2) {
+              camera.position.y = Math.max(0.2, anchorPos.y + 0.5);
             }
-            controls.target.lerp(desiredTargetPos, 0.1);
-        
+
+            // Safeguard against NaN/Infinity values
+            if (!Number.isFinite(camera.position.x) || !Number.isFinite(camera.position.y) || !Number.isFinite(camera.position.z)) {
+              console.warn('Camera follow produced invalid position, restoring last good position');
+              camera.position.copy(lastGoodCameraPosRef.current);
+              camera.quaternion.copy(lastGoodCameraQuatRef.current);
+              stopFollowing(); // Stop following to prevent further issues
+            } else {
+              // Update last good position
+              lastGoodCameraPosRef.current.copy(camera.position);
+              lastGoodCameraQuatRef.current.copy(camera.quaternion);
+            }
           } catch (e) {
-            console.error("Error in camera follow logic:", e);
-            stopFollowing(); // Stop following on error to prevent breaking the render loop
+            console.warn('Camera follow error, disabling follow:', e);
+            stopFollowing();
           }
         }
 
