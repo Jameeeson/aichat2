@@ -570,10 +570,10 @@ const stopFollowing = () => {
       }
     };
 
-    const releaseTypingPose = (holdMs = 1600) => {
+  const releaseTypingPose = (holdMs = 900) => {
       // Clear any previous timer and set a new one to release the frozen typing pose
       clearTypingHoldTimeout();
-      typingHoldTimeoutRef.current = window.setTimeout(() => {
+  typingHoldTimeoutRef.current = window.setTimeout(() => {
         typingHoldTimeoutRef.current = null;
         // Only proceed if typing is still considered active (we captured a pose)
         typingActiveRef.current = false;
@@ -595,7 +595,7 @@ const stopFollowing = () => {
         // clear frozen quaternions so subsequent animations are not clobbered
         typingHeadQuatRef.current = null;
         typingNeckQuatRef.current = null;
-      }, holdMs);
+  }, Math.min(holdMs, 700));
     };
 
   // Bone refs for subtle procedural motion during interrupt animation
@@ -647,6 +647,8 @@ const stopFollowing = () => {
       enableDamping: boolean;
       dampingFactor: number;
     } | null>(null);
+    // Track whether a BVH animation has completed since last idle/reset
+    const hasPlayedBVHSinceIdleRef = useRef(false);
     // Root motion capture between sequential BVH clips so the next clip starts
     // where the previous ended (accumulated on the model root, not on the hip).
     const rootMotionRef = useRef({
@@ -738,7 +740,7 @@ const stopFollowing = () => {
           source.onended = () => {
             isWaitingAfterTalkRef.current = true;
             source.onended = null;
-            const settleDelay = holdPose ? 200 : 2000;
+            const settleDelay = holdPose ? 160 : 480; // shorten non-hold freeze from 2000ms to 480ms
             setTimeout(() => {
               if (faceMesh) {
                 faceMesh.userData.visemes = [];
@@ -785,25 +787,28 @@ const stopFollowing = () => {
             const idleAct = idleActionRef.current;
             const ta1 = talkingAction1Ref.current;
             const ta2 = talkingAction2Ref.current;
-            let pick: THREE.AnimationAction | null = null;
-            if (ta1 && ta2) {
-              // simple alternate/random pick
-              pick = Math.random() < 0.5 ? ta1 : ta2;
-            } else if (ta1) pick = ta1;
-            else if (ta2) pick = ta2;
-
-            if (pick && mixer) {
-              try {
-                // fade out any loop/idle to let talking take over
-                const prevLoop = currentLoopActionRef.current;
-                if (prevLoop?.isRunning()) prevLoop.fadeOut(0.15);
-                else if (idleAct?.isRunning()) idleAct.fadeOut(0.15);
-              } catch (e) {}
-              try {
-                pick.reset().setEffectiveWeight(1).fadeIn(0.15).play();
-                currentlyPlayingTalkingActionRef.current = pick;
-                animationStateRef.current = "talking";
-              } catch (e) {}
+            // Only start body talking animation if no BVH has frozen the pose since last idle
+            if (!hasPlayedBVHSinceIdleRef.current) {
+              let pick: THREE.AnimationAction | null = null;
+              if (ta1 && ta2) {
+                pick = Math.random() < 0.5 ? ta1 : ta2;
+              } else if (ta1) pick = ta1;
+              else if (ta2) pick = ta2;
+              if (pick && mixer) {
+                try {
+                  const prevLoop = currentLoopActionRef.current;
+                  if (prevLoop?.isRunning()) prevLoop.fadeOut(0.15);
+                  else if (idleAct?.isRunning()) idleAct.fadeOut(0.15);
+                } catch (e) {}
+                try {
+                  pick.reset().setEffectiveWeight(1).fadeIn(0.15).play();
+                  currentlyPlayingTalkingActionRef.current = pick;
+                  animationStateRef.current = "talking";
+                } catch (e) {}
+              }
+            } else {
+              // Remain in frozen BVH final pose; state still counts as talking for visemes
+              animationStateRef.current = "talking";
             }
           } catch (e) {}
 
@@ -1018,7 +1023,7 @@ const processMixamoQueue = async () => {
         console.warn('ThreeCanvas: error playing queued mixamo gesture', err);
       }
       // Small pause between gestures
-      await new Promise((r) => setTimeout(r, 80));
+  await new Promise((r) => setTimeout(r, 35));
     }
   } finally {
     isProcessingMixamoRef.current = false;
@@ -1111,7 +1116,7 @@ const processMixamoQueue = async () => {
           while (performance.now() - start < timeoutMs) {
             if (mixerRef.current && bodyMeshRef.current) return true;
             // small backoff
-            await new Promise((r) => setTimeout(r, 100));
+            await new Promise((r) => setTimeout(r, 40));
           }
           return false;
         };
@@ -1311,9 +1316,11 @@ const processMixamoQueue = async () => {
 
                   // Leave in final pose; do not reset; keep accumulated transform
                   console.log("BVH animation finished; accumulated position:", modelRoot?.position.toArray());
+                  // Mark that we are now in a frozen BVH end pose so next speech skips body talking anims
+                  hasPlayedBVHSinceIdleRef.current = true;
                   
-                  // Resolve the promise after a short delay
-                  setTimeout(resolve, 300);
+                  // Resolve immediately (remove extra 300ms freeze)
+                  resolve();
                 }
               };
               mixer.addEventListener("finished", onFinished);
@@ -1363,6 +1370,8 @@ const processMixamoQueue = async () => {
           currentlyPlayingTalkingActionRef.current = null;
           animationStateRef.current = "idle";
           if (idle) idle.reset().setEffectiveWeight(1).fadeIn(0.4).play();
+          // Reset BVH-played flag so future speech can use body talking anims again
+          hasPlayedBVHSinceIdleRef.current = false;
         } catch (err) {
           // ignore errors during best-effort reset
         }
